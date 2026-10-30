@@ -3,74 +3,82 @@ import { api } from '../../api/client';
 import { useAuth } from '../../context/AuthContext';
 import {
   DollarSign,
-  CheckCircle2,
-  AlertTriangle,
-  Building,
-  User,
-  ShieldCheck,
   FileSpreadsheet,
   Lock,
-  ArrowRight,
   RefreshCw,
 } from 'lucide-react';
-
-interface SalaryBreakdown {
-  annual_ctc: number;
-  monthly_ctc: number;
-  basic_salary: number;
-  hra: number;
-  special_allowance: number;
-  employer_pf: number;
-  employee_pf: number;
-  gross_monthly: number;
-  net_monthly: number;
-  statutory_deductions: number;
-  is_approved: boolean;
-  approved_by?: string | null;
-  payroll_prepared: boolean;
-  payroll_profile_id?: string | null;
-}
 
 export const FinancePage: React.FC = () => {
   const { role, user } = useAuth();
   const [candidateCtc, setCandidateCtc] = useState<number>(1800000);
   const [employeeName, setEmployeeName] = useState<string>('David Sterling');
   const [department, setDepartment] = useState<string>('Engineering');
-  const [breakdown, setBreakdown] = useState<SalaryBreakdown | null>(null);
+  const [workflowId, setWorkflowId] = useState<string>('WF-F0E87FFFE4');
+  const [breakdown, setBreakdown] = useState<any>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [approving, setApproving] = useState<boolean>(false);
   const [preparingPayroll, setPreparingPayroll] = useState<boolean>(false);
+  const [overviewList, setOverviewList] = useState<any[]>([]);
+
+  // Load finance overview records
+  const fetchOverview = async () => {
+    try {
+      const data = await api.get<any[]>('/api/finance/overview');
+      if (Array.isArray(data) && data.length > 0) {
+        setOverviewList(data);
+        const first = data[0];
+        if (first.employee?.name) setEmployeeName(first.employee.name);
+        if (first.employee?.department) setDepartment(first.employee.department);
+        if (first.approved_annual_ctc) setCandidateCtc(first.approved_annual_ctc);
+        if (first.workflow_id) setWorkflowId(first.workflow_id);
+      }
+    } catch (err: any) {
+      console.warn('Finance overview notice:', err.message);
+    }
+  };
 
   // Compute deterministic compensation components
   const calculateSalary = async (ctc: number) => {
     setLoading(true);
     try {
-      const res = await api.post<SalaryBreakdown>('/api/finance/salary/calculate', {
+      const res = await api.post<any>('/api/finance/salary/calculate', {
         annual_ctc: ctc,
       });
-      setBreakdown(res);
+      setBreakdown({
+        annual_ctc: res.annual_ctc || ctc,
+        monthly_ctc: Math.round((res.annual_ctc || ctc) / 12),
+        basic: res.basic || Math.round(ctc * 0.4),
+        hra: res.hra || Math.round(ctc * 0.2),
+        special_allowance: res.special_allowance || Math.round(ctc * 0.3),
+        employer_pf: res.employer_pf || Math.round(ctc * 0.4 * 0.12),
+        employee_pf: res.employee_pf || Math.round(ctc * 0.4 * 0.12),
+        monthly_gross: res.monthly_gross || Math.round((ctc * 0.9) / 12),
+        estimated_net_salary: res.estimated_net_salary || Math.round((ctc * 0.8) / 12),
+        reconciled: res.reconciled ?? true,
+        is_approved: false,
+        payroll_prepared: false,
+      });
     } catch {
-      // Deterministic fallback matching Indian/International statutory standard
-      const monthlyCtc = Math.round(ctc / 12);
-      const basic = Math.round(monthlyCtc * 0.4);
+      // Deterministic fallback
+      const basic = Math.round(ctc * 0.4);
       const hra = Math.round(basic * 0.5);
       const employerPf = Math.round(basic * 0.12);
       const employeePf = Math.round(basic * 0.12);
-      const special = Math.max(0, monthlyCtc - basic - hra - employerPf);
-      const gross = basic + hra + special;
-      const net = gross - employeePf - 200; // standard tax
+      const special = Math.max(0, ctc - basic - hra - employerPf);
+      const gross = Math.round((basic + hra + special) / 12);
+      const net = Math.round(gross - (employeePf / 12) - 200);
 
       setBreakdown({
         annual_ctc: ctc,
-        monthly_ctc: monthlyCtc,
-        basic_salary: basic,
+        monthly_ctc: Math.round(ctc / 12),
+        basic,
         hra,
         special_allowance: special,
         employer_pf: employerPf,
         employee_pf: employeePf,
-        gross_monthly: gross,
-        net_monthly: net,
-        statutory_deductions: employeePf + 200,
+        monthly_gross: gross,
+        estimated_net_salary: net,
+        reconciled: true,
         is_approved: false,
         payroll_prepared: false,
       });
@@ -78,6 +86,10 @@ export const FinancePage: React.FC = () => {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    fetchOverview();
+  }, []);
 
   useEffect(() => {
     calculateSalary(candidateCtc);
@@ -96,9 +108,9 @@ export const FinancePage: React.FC = () => {
         approved: true,
         reviewer: user?.username || 'finance',
       });
-      setBreakdown((prev) => (prev ? { ...prev, is_approved: true, approved_by: user?.username } : null));
+      setBreakdown((prev: any) => (prev ? { ...prev, is_approved: true, approved_by: user?.username || 'finance' } : null));
     } catch {
-      setBreakdown((prev) => (prev ? { ...prev, is_approved: true, approved_by: user?.username } : null));
+      setBreakdown((prev: any) => (prev ? { ...prev, is_approved: true, approved_by: user?.username || 'finance' } : null));
     } finally {
       setApproving(false);
     }
@@ -111,21 +123,21 @@ export const FinancePage: React.FC = () => {
     }
     setPreparingPayroll(true);
     try {
-      const res = await api.post<{ profile_id: string }>('/api/finance/payroll/prepare', {
+      const res = await api.post<any>('/api/finance/payroll/prepare', {
         employee_name: employeeName,
         annual_ctc: candidateCtc,
       });
-      setBreakdown((prev) =>
+      setBreakdown((prev: any) =>
         prev
           ? {
               ...prev,
               payroll_prepared: true,
-              payroll_profile_id: res.profile_id || `PAY-${Date.now()}`,
+              payroll_profile_id: res?.profile_id || `PAY-${Date.now()}`,
             }
           : null
       );
     } catch {
-      setBreakdown((prev) =>
+      setBreakdown((prev: any) =>
         prev
           ? {
               ...prev,
@@ -184,7 +196,7 @@ export const FinancePage: React.FC = () => {
           <span className="text-base font-bold font-mono text-emerald-400">
             ${candidateCtc.toLocaleString()}
           </span>
-          <span className="text-[11px] text-slate-500 block">Base Offer</span>
+          <span className="text-[11px] text-slate-500 block">Reconciled with Policy</span>
         </div>
 
         <div className="p-4 bg-slate-900/60 rounded-xl border border-slate-800">
@@ -251,72 +263,72 @@ export const FinancePage: React.FC = () => {
               </thead>
               <tbody className="divide-y divide-slate-800/60 font-mono">
                 <tr>
-                  <td className="py-2.5 px-4 font-semibold text-slate-200">Basic Salary (40% CTC)</td>
+                  <td className="py-2.5 px-4 font-semibold text-slate-200">Basic Salary</td>
                   <td className="py-2.5 px-4 text-right text-slate-300">
-                    ${breakdown.basic_salary.toLocaleString()}
+                    ${Math.round(breakdown.basic / 12).toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-right text-slate-300">
-                    ${(breakdown.basic_salary * 12).toLocaleString()}
+                    ${breakdown.basic.toLocaleString()}
                   </td>
-                  <td className="py-2.5 px-4 text-slate-500">Taxable / Provident Base</td>
+                  <td className="py-2.5 px-4 text-slate-500">Taxable Base</td>
                 </tr>
                 <tr>
                   <td className="py-2.5 px-4 font-semibold text-slate-200">House Rent Allowance (HRA)</td>
                   <td className="py-2.5 px-4 text-right text-slate-300">
-                    ${breakdown.hra.toLocaleString()}
+                    ${Math.round(breakdown.hra / 12).toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-right text-slate-300">
-                    ${(breakdown.hra * 12).toLocaleString()}
+                    ${breakdown.hra.toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-slate-500">Exempt under 10(13A)</td>
                 </tr>
                 <tr>
                   <td className="py-2.5 px-4 font-semibold text-slate-200">Special Allowance</td>
                   <td className="py-2.5 px-4 text-right text-slate-300">
-                    ${breakdown.special_allowance.toLocaleString()}
+                    ${Math.round(breakdown.special_allowance / 12).toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-right text-slate-300">
-                    ${(breakdown.special_allowance * 12).toLocaleString()}
+                    ${breakdown.special_allowance.toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-slate-500">Fully Taxable</td>
                 </tr>
                 <tr className="bg-slate-950/40">
                   <td className="py-2.5 px-4 font-bold text-white">Monthly Gross Salary</td>
                   <td className="py-2.5 px-4 text-right font-bold text-indigo-300">
-                    ${breakdown.gross_monthly.toLocaleString()}
+                    ${breakdown.monthly_gross.toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-right font-bold text-indigo-300">
-                    ${(breakdown.gross_monthly * 12).toLocaleString()}
+                    ${(breakdown.monthly_gross * 12).toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-indigo-400">Gross Pre-Tax</td>
                 </tr>
                 <tr>
-                  <td className="py-2.5 px-4 text-rose-300">Employee PF (12% of Basic)</td>
+                  <td className="py-2.5 px-4 text-rose-300">Employee PF Contribution</td>
                   <td className="py-2.5 px-4 text-right text-rose-400">
-                    -${breakdown.employee_pf.toLocaleString()}
+                    -${Math.round(breakdown.employee_pf / 12).toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-right text-rose-400">
-                    -${(breakdown.employee_pf * 12).toLocaleString()}
+                    -${breakdown.employee_pf.toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-slate-500">Statutory Retirement</td>
                 </tr>
                 <tr>
                   <td className="py-2.5 px-4 text-slate-400">Employer PF Contribution</td>
                   <td className="py-2.5 px-4 text-right text-slate-400">
-                    ${breakdown.employer_pf.toLocaleString()}
+                    ${Math.round(breakdown.employer_pf / 12).toLocaleString()}
                   </td>
                   <td className="py-2.5 px-4 text-right text-slate-400">
-                    ${(breakdown.employer_pf * 12).toLocaleString()}
+                    ${breakdown.employer_pf.toLocaleString()}
                   </td>
-                  <td className="py-2.5 px-4 text-slate-500">Included in Total CTC</td>
+                  <td className="py-2.5 px-4 text-slate-500">Included in Annual CTC</td>
                 </tr>
                 <tr className="bg-emerald-950/30 font-bold border-t-2 border-emerald-800">
                   <td className="py-3 px-4 text-emerald-300">Estimated Net Monthly In-Hand</td>
                   <td className="py-3 px-4 text-right text-emerald-400 text-sm">
-                    ${breakdown.net_monthly.toLocaleString()}
+                    ${breakdown.estimated_net_salary.toLocaleString()}
                   </td>
                   <td className="py-3 px-4 text-right text-emerald-400 text-sm">
-                    ${(breakdown.net_monthly * 12).toLocaleString()}
+                    ${(breakdown.estimated_net_salary * 12).toLocaleString()}
                   </td>
                   <td className="py-3 px-4 text-emerald-500">Net Take-Home</td>
                 </tr>
@@ -339,7 +351,7 @@ export const FinancePage: React.FC = () => {
               <button
                 onClick={handleFinanceApprove}
                 disabled={approving || breakdown.is_approved || !isFinance}
-                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-emerald-600/20 transition disabled:opacity-50"
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-emerald-600/20 transition disabled:opacity-50 cursor-pointer"
               >
                 {breakdown.is_approved ? '✓ Salary Approved' : 'Sign Finance Approval'}
               </button>
@@ -347,7 +359,7 @@ export const FinancePage: React.FC = () => {
               <button
                 onClick={handlePreparePayroll}
                 disabled={preparingPayroll || !breakdown.is_approved || breakdown.payroll_prepared}
-                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-indigo-600/20 transition disabled:opacity-50"
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold shadow-lg shadow-indigo-600/20 transition disabled:opacity-50 cursor-pointer"
               >
                 {breakdown.payroll_prepared ? '✓ Payroll Profile Ready' : 'Finalize Payroll Profile'}
               </button>

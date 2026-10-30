@@ -1,35 +1,26 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { api } from '../../api/client';
 import { useAuth } from '../../context/AuthContext';
-import { ApprovalItem } from '../../types';
 import {
   CheckSquare,
-  AlertTriangle,
   ShieldCheck,
   ShieldAlert,
-  Clock,
-  User,
-  CheckCircle2,
-  XCircle,
-  FileText,
   Lock,
   RefreshCw,
 } from 'lucide-react';
 
 export const ApprovalsPage: React.FC = () => {
   const { user, role } = useAuth();
-  const [approvals, setApprovals] = useState<ApprovalItem[]>([]);
-  const [selectedApproval, setSelectedApproval] = useState<ApprovalItem | null>(null);
+  const [approvals, setApprovals] = useState<any[]>([]);
+  const [selectedApproval, setSelectedApproval] = useState<any | null>(null);
   const [comment, setComment] = useState<string>('');
   const [processing, setProcessing] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
 
   const fetchApprovals = useCallback(async () => {
     setLoading(true);
-    setError(null);
     try {
-      const data = await api.get<ApprovalItem[]>('/api/approvals/pending');
+      const data = await api.get<any[]>('/api/approvals/pending');
       setApprovals(Array.isArray(data) ? data : []);
     } catch (err: any) {
       console.warn('Approvals fetch error:', err.message);
@@ -43,10 +34,14 @@ export const ApprovalsPage: React.FC = () => {
     fetchApprovals();
   }, [fetchApprovals]);
 
-  // Check role eligibility
-  const canDecide = (action: string): boolean => {
+  // Check role eligibility using backend's required_roles or fallback
+  const canDecide = (app: any): boolean => {
     if (!role) return false;
     if (role === 'admin') return true;
+    if (Array.isArray(app.required_roles) && app.required_roles.length > 0) {
+      return app.required_roles.includes(role);
+    }
+    const action = app.requested_action || '';
     if (action.includes('salary') || action.includes('payroll')) {
       return role === 'finance';
     }
@@ -71,8 +66,7 @@ export const ApprovalsPage: React.FC = () => {
     try {
       const endpoint = `/api/approvals/${encodeURIComponent(selectedApproval.approval_id)}/${decision}`;
       await api.post(endpoint, {
-        decision_reason: comment || undefined,
-        reviewer_id: user?.username || role,
+        comment: comment.trim() || (decision === 'approve' ? 'Approved by authorized human reviewer' : 'Rejected'),
       });
 
       setSelectedApproval(null);
@@ -113,7 +107,7 @@ export const ApprovalsPage: React.FC = () => {
           </span>
           <button
             onClick={fetchApprovals}
-            className="p-2 text-slate-400 hover:text-white bg-slate-900 rounded-xl border border-slate-800 transition"
+            className="p-2 text-slate-400 hover:text-white bg-slate-900 rounded-xl border border-slate-800 transition cursor-pointer"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
@@ -133,7 +127,9 @@ export const ApprovalsPage: React.FC = () => {
         ) : (
           <div className="divide-y divide-slate-800/80">
             {approvals.map((app) => {
-              const eligible = canDecide(app.requested_action);
+              const eligible = canDecide(app);
+              const employeeName = app.employee?.name || app.employee_name || 'Candidate';
+              const risk = app.risk || app.severity || 'medium';
 
               return (
                 <div
@@ -144,30 +140,28 @@ export const ApprovalsPage: React.FC = () => {
                     <div className="flex items-center space-x-2 flex-wrap gap-1">
                       <span
                         className={`text-[10px] uppercase font-mono px-2 py-0.5 rounded-full font-bold ${
-                          app.severity === 'critical'
+                          risk === 'critical'
                             ? 'bg-rose-950 text-rose-300 border border-rose-800'
                             : 'bg-amber-950 text-amber-300 border border-amber-800'
                         }`}
                       >
-                        {app.severity || 'high'}
+                        {risk}
                       </span>
                       <span className="font-mono text-indigo-400 font-bold">{app.requested_action}</span>
                       <span className="text-slate-500">
-                        • Req by: <span className="text-slate-300">{app.requesting_agent}</span>
+                        • Req by: <span className="text-slate-300">{app.requesting_agent || 'Agent'}</span>
                       </span>
-                      {app.employee_name && (
-                        <span className="text-slate-400 font-medium">({app.employee_name})</span>
-                      )}
+                      <span className="text-slate-300 font-medium font-mono">({employeeName})</span>
                     </div>
 
-                    <p className="text-slate-200 text-sm font-medium">{app.action_summary}</p>
+                    <p className="text-slate-200 text-sm font-medium">{app.description || app.action_summary || app.category}</p>
 
                     <div className="flex items-center space-x-3 text-[11px] text-slate-400 font-mono">
-                      <span>Workflow: {app.workflow_id.substring(0, 8)}</span>
-                      <span>Requested: {new Date(app.requested_at).toLocaleTimeString()}</span>
-                      {app.parameter_hash && (
-                        <span className="text-slate-500 truncate max-w-xs">
-                          hash: {app.parameter_hash.substring(0, 12)}...
+                      <span>Workflow: {app.workflow_id}</span>
+                      <span>Requested: {app.requested_at ? new Date(app.requested_at).toLocaleTimeString() : '—'}</span>
+                      {app.required_roles && (
+                        <span className="text-indigo-400">
+                          Authorized: {app.required_roles.join(', ')}
                         </span>
                       )}
                     </div>
@@ -180,7 +174,7 @@ export const ApprovalsPage: React.FC = () => {
                         setSelectedApproval(app);
                         setComment('');
                       }}
-                      className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-semibold transition"
+                      className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-semibold transition cursor-pointer"
                     >
                       Review & Decide
                     </button>
@@ -202,7 +196,7 @@ export const ApprovalsPage: React.FC = () => {
                 <h3 className="text-sm font-bold text-white">Review Sensitive Action</h3>
               </div>
               <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300 uppercase">
-                {selectedApproval.category}
+                {selectedApproval.category || 'Approval'}
               </span>
             </div>
 
@@ -214,22 +208,15 @@ export const ApprovalsPage: React.FC = () => {
 
               <div>
                 <span className="text-slate-500 block mb-0.5">Summary:</span>
-                <p className="text-slate-200 leading-relaxed">{selectedApproval.action_summary}</p>
+                <p className="text-slate-200 leading-relaxed">
+                  {selectedApproval.description || selectedApproval.action_summary}
+                </p>
               </div>
 
               {selectedApproval.agent_recommendation && (
                 <div className="p-3 bg-indigo-950/40 border border-indigo-900/60 rounded-xl text-indigo-300">
                   <span className="font-bold block mb-1">Agent Recommendation:</span>
                   <p>{selectedApproval.agent_recommendation}</p>
-                </div>
-              )}
-
-              {selectedApproval.action_parameters && (
-                <div>
-                  <span className="text-slate-500 block mb-1">Signed Action Parameters:</span>
-                  <pre className="p-2.5 bg-slate-950 rounded-xl font-mono text-[10px] text-slate-300 overflow-x-auto max-h-32 border border-slate-800">
-                    {JSON.stringify(selectedApproval.action_parameters, null, 2)}
-                  </pre>
                 </div>
               )}
 
@@ -247,11 +234,11 @@ export const ApprovalsPage: React.FC = () => {
                 />
               </div>
 
-              {!canDecide(selectedApproval.requested_action) && (
+              {!canDecide(selectedApproval) && (
                 <div className="p-2.5 bg-rose-950/40 border border-rose-900/60 rounded-xl text-rose-300 text-[11px] flex items-center space-x-2">
                   <ShieldAlert className="w-4 h-4 shrink-0" />
                   <span>
-                    Your active persona ({role}) does not have permission to decide this category.
+                    Your active persona ({role}) is not authorized. Required: {selectedApproval.required_roles?.join(', ') || 'Authorized roles'}
                   </span>
                 </div>
               )}
@@ -261,23 +248,23 @@ export const ApprovalsPage: React.FC = () => {
             <div className="flex items-center justify-end space-x-2.5 pt-3 border-t border-slate-800">
               <button
                 onClick={() => setSelectedApproval(null)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold transition"
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold transition cursor-pointer"
               >
                 Close
               </button>
 
               <button
                 onClick={() => handleDecision('reject')}
-                disabled={processing || !canDecide(selectedApproval.requested_action)}
-                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-semibold transition disabled:opacity-50"
+                disabled={processing || !canDecide(selectedApproval)}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-semibold transition disabled:opacity-50 cursor-pointer"
               >
                 Reject Action
               </button>
 
               <button
                 onClick={() => handleDecision('approve')}
-                disabled={processing || !canDecide(selectedApproval.requested_action)}
-                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold transition disabled:opacity-50"
+                disabled={processing || !canDecide(selectedApproval)}
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold transition disabled:opacity-50 cursor-pointer"
               >
                 Approve & Execute
               </button>

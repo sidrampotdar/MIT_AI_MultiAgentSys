@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { WorkflowTask, TaskStatus } from '../../types';
+import { TaskStatus } from '../../types';
 import {
   CheckCircle2,
   Clock,
@@ -9,22 +9,22 @@ import {
   ChevronRight,
   ShieldAlert,
   Bot,
-  ArrowRight,
 } from 'lucide-react';
 import { api } from '../../api/client';
 
 interface ExecutionPlanTreeProps {
-  tasks: WorkflowTask[];
+  tasks: any[];
   onTaskUpdated?: () => void;
 }
 
-const statusConfig: Record<TaskStatus, { label: string; bg: string; text: string; icon: any }> = {
+const statusConfig: Record<string, { label: string; bg: string; text: string; icon: any }> = {
   completed: { label: 'Completed', bg: 'bg-emerald-950/60 border-emerald-800/80', text: 'text-emerald-300', icon: CheckCircle2 },
   in_progress: { label: 'In Progress', bg: 'bg-indigo-950/60 border-indigo-800/80', text: 'text-indigo-300 animate-pulse', icon: Clock },
   pending: { label: 'Pending', bg: 'bg-slate-900 border-slate-800', text: 'text-slate-400', icon: Clock },
   failed: { label: 'Failed', bg: 'bg-rose-950/60 border-rose-800/80', text: 'text-rose-300', icon: AlertTriangle },
   blocked: { label: 'Blocked (HITL)', bg: 'bg-amber-950/60 border-amber-800/80', text: 'text-amber-300', icon: ShieldAlert },
   cancelled: { label: 'Cancelled', bg: 'bg-slate-950 border-slate-900', text: 'text-slate-500', icon: AlertTriangle },
+  escalated: { label: 'Escalated', bg: 'bg-purple-950/60 border-purple-800/80', text: 'text-purple-300', icon: ShieldAlert },
 };
 
 export const ExecutionPlanTree: React.FC<ExecutionPlanTreeProps> = ({
@@ -64,9 +64,31 @@ export const ExecutionPlanTree: React.FC<ExecutionPlanTreeProps> = ({
   return (
     <div className="space-y-3">
       {tasks.map((task, index) => {
-        const conf = statusConfig[task.status] || statusConfig.pending;
+        const status = task.status || 'pending';
+        const conf = statusConfig[status] || statusConfig.pending;
         const Icon = conf.icon;
         const isExpanded = !!expandedTasks[task.task_id];
+        const agentName = task.assigned_agent || task.agent || 'Planner';
+        
+        let deps: string[] = [];
+        if (Array.isArray(task.dependencies)) deps = task.dependencies;
+        else if (Array.isArray(task.depends_on)) deps = task.depends_on;
+        else if (typeof task.depends_on_json === 'string') {
+          try {
+            deps = JSON.parse(task.depends_on_json);
+          } catch {
+            deps = [];
+          }
+        }
+
+        let outputData = task.result;
+        if (!outputData && typeof task.result_json === 'string') {
+          try {
+            outputData = JSON.parse(task.result_json);
+          } catch {
+            outputData = task.result_json;
+          }
+        }
 
         return (
           <div
@@ -96,16 +118,16 @@ export const ExecutionPlanTree: React.FC<ExecutionPlanTreeProps> = ({
 
                 <div className="truncate">
                   <span className="text-sm font-semibold text-slate-200">
-                    {task.description || task.action}
+                    {task.description || task.action || task.task_id}
                   </span>
                   <div className="flex items-center space-x-2 text-xs text-slate-400 mt-0.5">
                     <span className="flex items-center space-x-1 font-mono text-[11px] text-indigo-400">
                       <Bot className="w-3 h-3" />
-                      <span>{task.assigned_agent}</span>
+                      <span>{agentName}</span>
                     </span>
-                    {task.dependencies && task.dependencies.length > 0 && (
+                    {deps.length > 0 && (
                       <span className="text-[11px] text-slate-500">
-                        • Depends on: {task.dependencies.join(', ')}
+                        • Depends on: {deps.join(', ')}
                       </span>
                     )}
                   </div>
@@ -114,9 +136,9 @@ export const ExecutionPlanTree: React.FC<ExecutionPlanTreeProps> = ({
 
               {/* Status and Action Buttons */}
               <div className="flex items-center space-x-2.5">
-                {task.retry_count > 0 && (
+                {(task.retry_count > 0 || task.attempts > 1) && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
-                    {task.retry_count} retries
+                    {task.retry_count || task.attempts} retries
                   </span>
                 )}
 
@@ -126,7 +148,7 @@ export const ExecutionPlanTree: React.FC<ExecutionPlanTreeProps> = ({
                   {conf.label}
                 </span>
 
-                {task.status === 'failed' && (
+                {status === 'failed' && (
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -175,11 +197,11 @@ export const ExecutionPlanTree: React.FC<ExecutionPlanTreeProps> = ({
                   </div>
                 )}
 
-                {task.result && (
+                {outputData && (
                   <div>
                     <span className="text-slate-500 block mb-1">Execution Output / Evidence:</span>
                     <pre className="p-2.5 bg-slate-900 rounded-lg font-mono text-[11px] text-slate-300 overflow-x-auto max-h-40 border border-slate-800">
-                      {JSON.stringify(task.result, null, 2)}
+                      {typeof outputData === 'object' ? JSON.stringify(outputData, null, 2) : outputData}
                     </pre>
                   </div>
                 )}

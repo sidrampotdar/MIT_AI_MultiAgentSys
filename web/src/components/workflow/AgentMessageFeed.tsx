@@ -1,21 +1,43 @@
 import React, { useState } from 'react';
-import { AgentMessage } from '../../types';
-import { MessageSquare, ArrowRight, CornerDownRight, Clock, Filter } from 'lucide-react';
+import { MessageSquare, ArrowRight, Clock, Filter } from 'lucide-react';
 
 interface AgentMessageFeedProps {
-  messages: AgentMessage[];
+  messages: any[];
 }
 
 export const AgentMessageFeed: React.FC<AgentMessageFeedProps> = ({ messages }) => {
   const [filterAgent, setFilterAgent] = useState<string>('all');
   const [expandedMessage, setExpandedMessage] = useState<string | null>(null);
 
+  // Normalize messages
+  const normalized = messages.map((m, idx) => {
+    let payload = m.payload;
+    if (!payload && typeof m.data_json === 'string') {
+      try {
+        payload = JSON.parse(m.data_json);
+      } catch {
+        payload = m.data_json;
+      }
+    }
+
+    return {
+      id: m.message_id || `msg-${idx}`,
+      sender: m.sender_agent || m.sender || 'Agent',
+      receiver: m.recipient_agent || m.receiver || 'Agent',
+      type: m.message_type || 'communication',
+      summary: m.content || m.summary || 'Transmitted operational payload',
+      correlationId: m.correlation_id || null,
+      timestamp: m.timestamp || new Date().toISOString(),
+      payload,
+    };
+  });
+
   // Collect distinct agents
   const agentList = Array.from(
-    new Set(messages.flatMap((m) => [m.sender, m.receiver]).filter(Boolean))
+    new Set(normalized.flatMap((m) => [m.sender, m.receiver]).filter(Boolean))
   );
 
-  const filteredMessages = messages.filter((m) => {
+  const filteredMessages = normalized.filter((m) => {
     if (filterAgent === 'all') return true;
     return m.sender === filterAgent || m.receiver === filterAgent;
   });
@@ -64,12 +86,12 @@ export const AgentMessageFeed: React.FC<AgentMessageFeedProps> = ({ messages }) 
           </div>
         ) : (
           filteredMessages.map((msg) => {
-            const isExpanded = expandedMessage === msg.message_id;
+            const isExpanded = expandedMessage === msg.id;
 
             return (
               <div
-                key={msg.message_id}
-                onClick={() => setExpandedMessage(isExpanded ? null : msg.message_id)}
+                key={msg.id}
+                onClick={() => setExpandedMessage(isExpanded ? null : msg.id)}
                 className="p-3 bg-slate-950/80 hover:bg-slate-800/60 border border-slate-800/80 rounded-xl transition cursor-pointer"
               >
                 {/* Sender -> Receiver Bar */}
@@ -91,11 +113,11 @@ export const AgentMessageFeed: React.FC<AgentMessageFeedProps> = ({ messages }) 
                 {/* Footer Meta */}
                 <div className="mt-2 flex items-center justify-between text-[10px] text-slate-500 font-mono">
                   <span className="bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800 text-slate-400">
-                    {msg.message_type}
+                    {msg.type}
                   </span>
-                  {msg.correlation_id && (
+                  {msg.correlationId && (
                     <span className="truncate max-w-[140px]">
-                      corr: {msg.correlation_id}
+                      corr: {msg.correlationId}
                     </span>
                   )}
                 </div>
@@ -105,7 +127,7 @@ export const AgentMessageFeed: React.FC<AgentMessageFeedProps> = ({ messages }) 
                   <div className="mt-2.5 pt-2 border-t border-slate-800/80">
                     <span className="text-[10px] text-slate-400 block mb-1">Payload:</span>
                     <pre className="p-2 bg-slate-900 rounded font-mono text-[10px] text-slate-300 overflow-x-auto max-h-36">
-                      {JSON.stringify(msg.payload, null, 2)}
+                      {typeof msg.payload === 'object' ? JSON.stringify(msg.payload, null, 2) : msg.payload}
                     </pre>
                   </div>
                 )}
