@@ -5,9 +5,10 @@
 const BASE_URL = '';
 
 export interface ApiErrorResponse {
-  status: number;
+
   message: string;
   detail?: string | any;
+  status: number;
 }
 
 export class ApiError extends Error {
