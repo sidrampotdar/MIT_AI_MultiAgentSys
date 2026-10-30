@@ -7,3 +7,4 @@ pytest
 pyjwt
 fastapi
 uvicorn
+python-multipart

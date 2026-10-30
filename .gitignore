@@ -10,3 +10,7 @@ wheels/
 .venv
 .env
 *.db
+uploads/
+__pycache__/
+node_modules/
+web/dist/

@@ -11,7 +11,7 @@ def _start(api):
 
 def _approval_for(api, workflow_id, action):
     pending = api.get("/api/approvals/pending", params={"workflow_id": workflow_id}, headers=api.login("viewer")).json()
-    return next(a for a in pending if a["action"] == action)
+    return next(a for a in pending if a["requested_action"] == action)
 
 
 def test_missing_authentication_is_rejected(api):
