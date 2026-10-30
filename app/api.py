@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
@@ -453,33 +453,70 @@ def replan_workflow_api(workflow_id: str, payload: ReplanPayload, _user: Current
     return service.replan(workflow_id, reason=payload.reason)
 
 
+SSE_POLL_SECONDS = float(os.getenv("SSE_POLL_SECONDS", "1.0"))
+SSE_HEARTBEAT_SECONDS = float(os.getenv("SSE_HEARTBEAT_SECONDS", "15"))
+SSE_RETRY_MS = 3000
+
+
+def _sse(event: str, data: dict[str, Any], event_id: int | None = None) -> str:
+    head = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{head}event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def workflow_event_stream(
+    service: OnboardingService,
+    workflow_id: str,
+    last_event_id: int,
+    is_disconnected,
+    poll_seconds: float = SSE_POLL_SECONDS,
+    heartbeat_seconds: float = SSE_HEARTBEAT_SECONDS,
+) -> AsyncGenerator[str, None]:
+    """Stream persisted workflow events, resumable from ``last_event_id``.
+
+    Events are read from the durable audit log (sequence = rowid) instead of an
+    in-memory subscription, so a reconnecting client resumes without gaps or
+    duplicates, nothing is registered that needs cleanup, and the stream lives
+    until the client disconnects.
+    """
+    yield f"retry: {SSE_RETRY_MS}\n" + _sse("connected", {
+        "workflow_id": workflow_id,
+        "resumed_from": last_event_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    cursor = last_event_id
+    idle = 0.0
+    while not await is_disconnected():
+        events = await asyncio.to_thread(service.state.audit_events_since, workflow_id, cursor)
+        if events:
+            for event in events:
+                cursor = event["seq"]
+                yield _sse("workflow.event", event, event["seq"])
+            idle = 0.0
+            continue
+        await asyncio.sleep(poll_seconds)
+        idle += poll_seconds
+        if idle >= heartbeat_seconds:
+            idle = 0.0
+            yield ": heartbeat\n\n"
+
+
 @app.get("/api/workflows/{workflow_id}/events", tags=["C. Workflows"])
-async def sse_workflow_events(workflow_id: str, _user: CurrentUser = Depends(get_current_user_for_stream)) -> StreamingResponse:
-    """Live Server-Sent Events (SSE) stream for real-time frontend monitoring."""
+async def sse_workflow_events(
+    workflow_id: str,
+    request: Request,
+    last_event_id: int | None = Query(default=None, ge=0),
+    _user: CurrentUser = Depends(get_current_user_for_stream),
+) -> StreamingResponse:
+    """Long-lived, reconnectable Server-Sent Events stream of persisted workflow events."""
     service = get_service()
     _workflow_or_404(service, workflow_id)
-
-    async def event_generator(_user: CurrentUser = Depends(get_current_user)) -> AsyncGenerator[str, None]:
-        # Send initial connected event
-        yield f"event: connected\ndata: {json.dumps({'workflow_id': workflow_id, 'timestamp': datetime.now(timezone.utc).isoformat()})}\n\n"
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-
-        def listener(payload: dict[str, Any]):
-            if payload.get("workflow_id") == workflow_id:
-                queue.put_nowait(payload)
-
-        service.dispatcher.subscribe("*", listener)
-        try:
-            for _ in range(15):  # stream active updates
-                try:
-                    event_data = await asyncio.wait_for(queue.get(), timeout=1.5)
-                    yield f"event: workflow.update\ndata: {json.dumps(event_data)}\n\n"
-                except asyncio.TimeoutError:
-                    yield f": heartbeat\n\n"
-        finally:
-            pass
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    header = request.headers.get("last-event-id", "")
+    cursor = last_event_id if last_event_id is not None else (int(header) if header.isdigit() else 0)
+    return StreamingResponse(
+        workflow_event_stream(service, workflow_id, cursor, request.is_disconnected),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 # ============================================================================

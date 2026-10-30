@@ -655,6 +655,18 @@ class WorkflowStateStore:
         self.connection.commit()
         return event_id
 
+    def audit_events_since(self, workflow_id: str, after_seq: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+        """Persisted events with a monotonic sequence number (rowid) for resumable streaming."""
+        rows = self.connection.execute(
+            "SELECT rowid AS seq, * FROM audit_events WHERE workflow_id=? AND rowid>? ORDER BY rowid LIMIT ?",
+            (workflow_id, after_seq, limit),
+        ).fetchall()
+        return [{**dict(row), "input": json.loads(row["input_json"]), "output": json.loads(row["output_json"])} for row in rows]
+
+    def latest_audit_seq(self, workflow_id: str) -> int:
+        row = self.connection.execute("SELECT COALESCE(MAX(rowid), 0) AS seq FROM audit_events WHERE workflow_id=?", (workflow_id,)).fetchone()
+        return int(row["seq"])
+
     def audit_events(self, workflow_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT * FROM audit_events WHERE workflow_id=? ORDER BY timestamp, rowid", (workflow_id,)).fetchall()
         return [{**dict(row), "input": json.loads(row["input_json"]), "output": json.loads(row["output_json"])} for row in rows]
