@@ -342,7 +342,14 @@ class OnboardingService:
             {"workflow_id": workflow_id, "task_id": task["task_id"], "tool": tool_name, "status": status}
         )
 
-    def decide_approval(self, approval_id: str, reviewer: str, decision: str, comment: str = "") -> dict[str, Any]:
+    def decide_approval(
+        self,
+        approval_id: str,
+        reviewer: str,
+        decision: str,
+        comment: str = "",
+        reviewer_role: str | None = None,
+    ) -> dict[str, Any]:
         if decision not in {"approved", "rejected"}:
             raise ValueError("Decision must be 'approved' or 'rejected'")
 
@@ -356,7 +363,7 @@ class OnboardingService:
             reviewer,
             f"approval_{decision}",
             decision,
-            {"approval_id": approval_id},
+            {"approval_id": approval_id, "reviewer_role": reviewer_role},
             {"comment": comment}
         )
         self.dispatcher.publish_event(

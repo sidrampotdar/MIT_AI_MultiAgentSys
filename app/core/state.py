@@ -143,6 +143,15 @@ class WorkflowStateStore:
                 status TEXT NOT NULL,
                 timestamp TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS audit_events (
                 event_id TEXT PRIMARY KEY,
                 workflow_id TEXT NOT NULL,
@@ -577,6 +586,39 @@ class WorkflowStateStore:
         query += " ORDER BY timestamp DESC"
         rows = self.connection.execute(query, params).fetchall()
         return [dict(r) for r in rows]
+
+    # --- Users ---
+
+    def create_user(self, username: str, password_hash: str, role: str, full_name: str) -> dict[str, Any]:
+        now = _now()
+        try:
+            self.connection.execute(
+                "INSERT INTO users VALUES (?, ?, ?, ?, 1, ?, ?)",
+                (username, password_hash, role, full_name, now, now),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"User '{username}' already exists") from exc
+        self.connection.commit()
+        return self.user(username)
+
+    def user(self, username: str) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        if not row:
+            raise KeyError(f"User {username} was not found")
+        return dict(row)
+
+    def list_users(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute("SELECT * FROM users ORDER BY username").fetchall()
+        return [dict(r) for r in rows]
+
+    def update_user(self, username: str, role: str | None = None, is_active: bool | None = None) -> dict[str, Any]:
+        self.user(username)
+        if role is not None:
+            self.connection.execute("UPDATE users SET role=?, updated_at=? WHERE username=?", (role, _now(), username))
+        if is_active is not None:
+            self.connection.execute("UPDATE users SET is_active=?, updated_at=? WHERE username=?", (int(is_active), _now(), username))
+        self.connection.commit()
+        return self.user(username)
 
     # --- Tamper-Evident Hash-Chained Audit Trail ---
 

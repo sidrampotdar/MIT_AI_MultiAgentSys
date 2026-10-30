@@ -20,6 +20,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
+from app.auth import (
+    ALL_ROLES,
+    CurrentUser,
+    Role,
+    allowed_origins,
+    approval_roles_for,
+    bootstrap_admin,
+    create_access_token,
+    get_current_user,
+    get_current_user_for_stream,
+    hash_password,
+    require_roles,
+    verify_password,
+)
 from app.core.llm import Message, create_provider
 from app.core.salary import SalaryCalculationEngine
 from app.core.service import OnboardingService, default_employee
@@ -49,9 +63,26 @@ class OnboardPayload(AppBaseModel):
 
 
 class ApprovalPayload(AppBaseModel):
-    reviewer: str = Field(default="HR Compliance Officer", min_length=1)
-    decision: Literal["approved", "rejected"]
+    """Reviewer identity is never accepted from the client; it comes from the access token."""
+
     comment: str = ""
+
+
+class LoginPayload(AppBaseModel):
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
+
+class UserCreatePayload(AppBaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=8)
+    role: str
+    full_name: str = Field(min_length=1)
+
+
+class UserUpdatePayload(AppBaseModel):
+    role: str | None = None
+    is_active: bool | None = None
 
 
 class ReplanPayload(AppBaseModel):
@@ -145,7 +176,7 @@ class RedFlagResolvePayload(AppBaseModel):
 _global_service: OnboardingService | None = None
 
 
-def get_service() -> OnboardingService:
+def get_service(_user: CurrentUser = Depends(get_current_user)) -> OnboardingService:
     global _global_service
     db_path = os.getenv("WORKFLOW_DATABASE", "enterprise_onboarding.db")
     provider_name = os.getenv("LLM_PROVIDER", "groq")
@@ -154,16 +185,11 @@ def get_service() -> OnboardingService:
     return _global_service
 
 
-def get_current_user_role(x_user_role: str = Header(default="admin")) -> str:
-    """Simulated Role-Based Access Control for Hackathon."""
-    return x_user_role.lower()
-
-
 # --- Application Lifecycle ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_service()
+    bootstrap_admin(get_service().state)
     yield
 
 
@@ -176,16 +202,77 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
 )
 
 
-def _workflow_or_404(service: OnboardingService, workflow_id: str) -> dict[str, Any]:
+def _workflow_or_404(service: OnboardingService, workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     try:
         return service.status(workflow_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ============================================================================
+# 0. Authentication and User Management
+# ============================================================================
+
+@app.post("/api/auth/login", tags=["0. Auth"])
+def login_api(payload: LoginPayload) -> dict[str, Any]:
+    service = get_service()
+    try:
+        user = service.state.user(payload.username)
+    except KeyError:
+        user = None
+    # Same response for unknown user, wrong password and deactivated account.
+    if not user or not user["is_active"] or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password", headers={"WWW-Authenticate": "Bearer"})
+    token, expires = create_access_token(user["username"], user["role"])
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": expires.isoformat(),
+        "user": {"username": user["username"], "role": user["role"], "full_name": user["full_name"]},
+    }
+
+
+@app.get("/api/auth/me", tags=["0. Auth"])
+def me_api(user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
+    return {"username": user.username, "role": user.role, "full_name": user.full_name}
+
+
+def _public_user(user: dict[str, Any]) -> dict[str, Any]:
+    return {k: user[k] for k in ("username", "role", "full_name", "is_active", "created_at")}
+
+
+@app.get("/api/users", tags=["0. Auth"])
+def list_users_api(_user: CurrentUser = Depends(require_roles(Role.ADMIN))) -> list[dict[str, Any]]:
+    return [_public_user(u) for u in get_service().state.list_users()]
+
+
+@app.post("/api/users", status_code=201, tags=["0. Auth"])
+def create_user_api(payload: UserCreatePayload, _user: CurrentUser = Depends(require_roles(Role.ADMIN))) -> dict[str, Any]:
+    if payload.role not in ALL_ROLES:
+        raise HTTPException(status_code=422, detail=f"Unknown role '{payload.role}'")
+    try:
+        return _public_user(get_service().state.create_user(
+            payload.username, hash_password(payload.password), payload.role, payload.full_name
+        ))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.patch("/api/users/{username}", tags=["0. Auth"])
+def update_user_api(username: str, payload: UserUpdatePayload, admin: CurrentUser = Depends(require_roles(Role.ADMIN))) -> dict[str, Any]:
+    if payload.role is not None and payload.role not in ALL_ROLES:
+        raise HTTPException(status_code=422, detail=f"Unknown role '{payload.role}'")
+    if username == admin.username and (payload.is_active is False or (payload.role and payload.role != Role.ADMIN.value)):
+        raise HTTPException(status_code=409, detail="Admins cannot demote or deactivate themselves")
+    try:
+        return _public_user(get_service().state.update_user(username, payload.role, payload.is_active))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -201,7 +288,7 @@ def health() -> dict[str, str]:
 
 
 @app.get("/api/system/info", tags=["A. System"])
-def system_info() -> dict[str, Any]:
+def system_info(_user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     service = get_service()
     return {
         "system": "Enterprise Autonomous Onboarding System",
@@ -214,7 +301,7 @@ def system_info() -> dict[str, Any]:
 
 
 @app.get("/api/llm/providers", tags=["A. System"])
-def llm_providers() -> dict[str, Any]:
+def llm_providers(_user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     return {
         "providers": [
             {"id": "groq", "name": "Groq LPU", "description": "High-throughput inference"},
@@ -226,7 +313,7 @@ def llm_providers() -> dict[str, Any]:
 
 
 @app.get("/api/llm/models", tags=["A. System"])
-def llm_models() -> dict[str, Any]:
+def llm_models(_user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     return {
         "gemini": ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest"],
         "groq": ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"],
@@ -235,7 +322,7 @@ def llm_models() -> dict[str, Any]:
 
 
 @app.post("/api/llm/test", tags=["A. System"])
-def llm_test(payload: LLMTestPayload) -> dict[str, Any]:
+def llm_test(payload: LLMTestPayload, _user: CurrentUser = Depends(require_roles(Role.ADMIN))) -> dict[str, Any]:
     try:
         provider = create_provider(payload.provider, with_fallback=False)
         messages = [
@@ -259,7 +346,7 @@ def llm_test(payload: LLMTestPayload) -> dict[str, Any]:
 # ============================================================================
 
 @app.post("/api/employees", status_code=201, tags=["B. Employees"])
-def create_employee_api(payload: EmployeeCreatePayload) -> dict[str, Any]:
+def create_employee_api(payload: EmployeeCreatePayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     try:
         return service.state.create_employee_record(payload.model_dump())
@@ -268,12 +355,12 @@ def create_employee_api(payload: EmployeeCreatePayload) -> dict[str, Any]:
 
 
 @app.get("/api/employees", tags=["B. Employees"])
-def list_employees_api() -> list[dict[str, Any]]:
+def list_employees_api(_user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return get_service().state.list_employees()
 
 
 @app.get("/api/employees/{employee_id}", tags=["B. Employees"])
-def get_employee_api(employee_id: str) -> dict[str, Any]:
+def get_employee_api(employee_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     try:
         return get_service().state.get_employee_record(employee_id)
     except KeyError as exc:
@@ -281,7 +368,7 @@ def get_employee_api(employee_id: str) -> dict[str, Any]:
 
 
 @app.patch("/api/employees/{employee_id}", tags=["B. Employees"])
-def update_employee_api(employee_id: str, payload: EmployeeUpdatePayload) -> dict[str, Any]:
+def update_employee_api(employee_id: str, payload: EmployeeUpdatePayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
     try:
         return get_service().state.update_employee_record(employee_id, updates)
@@ -295,7 +382,7 @@ def update_employee_api(employee_id: str, payload: EmployeeUpdatePayload) -> dic
 
 @app.post("/workflows", status_code=201, tags=["C. Workflows"])
 @app.post("/api/workflows/onboarding", status_code=201, tags=["C. Workflows"])
-def create_workflow_api(payload: OnboardPayload) -> dict[str, Any]:
+def create_workflow_api(payload: OnboardPayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     emp = default_employee(payload.name, payload.email)
     emp.update(payload.model_dump())
@@ -305,25 +392,25 @@ def create_workflow_api(payload: OnboardPayload) -> dict[str, Any]:
 
 @app.get("/workflows", tags=["C. Workflows"])
 @app.get("/api/workflows", tags=["C. Workflows"])
-def list_workflows_api(limit: int = Query(default=20, le=100)) -> list[dict[str, Any]]:
+def list_workflows_api(limit: int = Query(default=20, le=100), _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return get_service().state.list_workflows(limit=limit)
 
 
 @app.get("/workflows/{workflow_id}", tags=["C. Workflows"])
 @app.get("/api/workflows/{workflow_id}", tags=["C. Workflows"])
-def workflow_status_api(workflow_id: str) -> dict[str, Any]:
+def workflow_status_api(workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     return _workflow_or_404(get_service(), workflow_id)
 
 
 @app.get("/api/workflows/{workflow_id}/tasks", tags=["C. Workflows"])
-def workflow_tasks_api(workflow_id: str) -> list[dict[str, Any]]:
+def workflow_tasks_api(workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     return service.state.tasks(workflow_id)
 
 
 @app.get("/api/workflows/{workflow_id}/status", tags=["C. Workflows"])
-def workflow_status_summary_api(workflow_id: str) -> dict[str, Any]:
+def workflow_status_summary_api(workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     wf = _workflow_or_404(get_service(), workflow_id)
     tasks = wf.get("tasks", [])
     return {
@@ -338,7 +425,7 @@ def workflow_status_summary_api(workflow_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/workflows/{workflow_id}/pause", tags=["C. Workflows"])
-def pause_workflow_api(workflow_id: str) -> dict[str, Any]:
+def pause_workflow_api(workflow_id: str, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     return service.pause(workflow_id)
@@ -346,33 +433,33 @@ def pause_workflow_api(workflow_id: str) -> dict[str, Any]:
 
 @app.post("/workflows/{workflow_id}/resume", tags=["C. Workflows"])
 @app.post("/api/workflows/{workflow_id}/resume", tags=["C. Workflows"])
-def resume_workflow_api(workflow_id: str) -> dict[str, Any]:
+def resume_workflow_api(workflow_id: str, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     return service.resume(workflow_id)
 
 
 @app.post("/api/workflows/{workflow_id}/cancel", tags=["C. Workflows"])
-def cancel_workflow_api(workflow_id: str) -> dict[str, Any]:
+def cancel_workflow_api(workflow_id: str, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     return service.cancel(workflow_id)
 
 
 @app.post("/api/workflows/{workflow_id}/replan", tags=["C. Workflows"])
-def replan_workflow_api(workflow_id: str, payload: ReplanPayload) -> dict[str, Any]:
+def replan_workflow_api(workflow_id: str, payload: ReplanPayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     return service.replan(workflow_id, reason=payload.reason)
 
 
 @app.get("/api/workflows/{workflow_id}/events", tags=["C. Workflows"])
-async def sse_workflow_events(workflow_id: str) -> StreamingResponse:
+async def sse_workflow_events(workflow_id: str, _user: CurrentUser = Depends(get_current_user_for_stream)) -> StreamingResponse:
     """Live Server-Sent Events (SSE) stream for real-time frontend monitoring."""
     service = get_service()
     _workflow_or_404(service, workflow_id)
 
-    async def event_generator() -> AsyncGenerator[str, None]:
+    async def event_generator(_user: CurrentUser = Depends(get_current_user)) -> AsyncGenerator[str, None]:
         # Send initial connected event
         yield f"event: connected\ndata: {json.dumps({'workflow_id': workflow_id, 'timestamp': datetime.now(timezone.utc).isoformat()})}\n\n"
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -400,7 +487,7 @@ async def sse_workflow_events(workflow_id: str) -> StreamingResponse:
 # ============================================================================
 
 @app.post("/api/planner/create-plan", tags=["D. Planner"])
-def create_plan_api(payload: OnboardPayload) -> dict[str, Any]:
+def create_plan_api(payload: OnboardPayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     from app.core.planner import Planner
     from app.core.service import PLAN
     service = get_service()
@@ -412,13 +499,13 @@ def create_plan_api(payload: OnboardPayload) -> dict[str, Any]:
 
 
 @app.get("/api/planner/plans/{workflow_id}", tags=["D. Planner"])
-def get_workflow_plan_api(workflow_id: str) -> list[dict[str, Any]]:
+def get_workflow_plan_api(workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     wf = _workflow_or_404(get_service(), workflow_id)
     return wf.get("plan", [])
 
 
 @app.post("/api/planner/replan/{workflow_id}", tags=["D. Planner"])
-def replan_plan_api(workflow_id: str, payload: ReplanPayload) -> dict[str, Any]:
+def replan_plan_api(workflow_id: str, payload: ReplanPayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     return service.replan(workflow_id, reason=payload.reason)
@@ -430,12 +517,12 @@ def replan_plan_api(workflow_id: str, payload: ReplanPayload) -> dict[str, Any]:
 
 @app.get("/agents", tags=["E. Agents"])
 @app.get("/api/agents", tags=["E. Agents"])
-def list_agents_api() -> list[dict[str, Any]]:
+def list_agents_api(_user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return get_service().dispatcher.list_agents()
 
 
 @app.get("/api/agents/{agent_name}", tags=["E. Agents"])
-def get_agent_api(agent_name: str) -> dict[str, Any]:
+def get_agent_api(agent_name: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     agent = get_service().dispatcher.get_agent(agent_name)
     if not agent:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
@@ -448,7 +535,7 @@ def get_agent_api(agent_name: str) -> dict[str, Any]:
 
 
 @app.get("/api/agents/{agent_name}/status", tags=["E. Agents"])
-def get_agent_status_api(agent_name: str) -> dict[str, Any]:
+def get_agent_status_api(agent_name: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     agent = get_service().dispatcher.get_agent(agent_name)
     if not agent:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
@@ -456,7 +543,7 @@ def get_agent_status_api(agent_name: str) -> dict[str, Any]:
 
 
 @app.get("/api/workflows/{workflow_id}/agents", tags=["E. Agents"])
-def get_workflow_agents_api(workflow_id: str) -> list[dict[str, Any]]:
+def get_workflow_agents_api(workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     wf = _workflow_or_404(get_service(), workflow_id)
     tasks = wf.get("tasks", [])
     used_agents = {t["agent"] for t in tasks}
@@ -467,7 +554,7 @@ def get_workflow_agents_api(workflow_id: str) -> list[dict[str, Any]]:
 
 
 @app.get("/api/workflows/{workflow_id}/agent-messages", tags=["E. Agents"])
-def get_agent_messages_api(workflow_id: str) -> list[dict[str, Any]]:
+def get_agent_messages_api(workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     return service.state.list_agent_messages(workflow_id)
@@ -478,12 +565,22 @@ def get_agent_messages_api(workflow_id: str) -> list[dict[str, Any]]:
 # ============================================================================
 
 @app.get("/api/tools", tags=["F. Tools"])
-def list_tools_api() -> list[dict[str, Any]]:
+def list_tools_api(_user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return get_service().registry.list_tools()
 
 
+@app.get("/api/tools/agents/permissions", tags=["F. Tools"])
+def get_tool_permissions_api(_user: CurrentUser = Depends(get_current_user)) -> dict[str, list[str]]:
+    service = get_service()
+    permissions: dict[str, list[str]] = {}
+    for agent in service.agents():
+        defs = service.registry.definitions_for(agent)
+        permissions[agent] = [d["function"]["name"] for d in defs]
+    return permissions
+
+
 @app.get("/api/tools/{tool_name}", tags=["F. Tools"])
-def get_tool_api(tool_name: str) -> dict[str, Any]:
+def get_tool_api(tool_name: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     tool = get_service().registry.get_tool(tool_name)
     if not tool:
         raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
@@ -497,22 +594,12 @@ def get_tool_api(tool_name: str) -> dict[str, Any]:
     }
 
 
-@app.get("/api/tools/agents/permissions", tags=["F. Tools"])
-def get_tool_permissions_api() -> dict[str, list[str]]:
-    service = get_service()
-    permissions: dict[str, list[str]] = {}
-    for agent in service.agents():
-        defs = service.registry.definitions_for(agent)
-        permissions[agent] = [d["function"]["name"] for d in defs]
-    return permissions
-
-
 # ============================================================================
 # G. Education Verification APIs
 # ============================================================================
 
 @app.post("/api/verification/education", status_code=201, tags=["G. Education Verification"])
-def submit_education_verification_api(payload: EducationVerificationPayload) -> dict[str, Any]:
+def submit_education_verification_api(payload: EducationVerificationPayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, payload.workflow_id)
     vid = service.state.save_verification(
@@ -527,7 +614,7 @@ def submit_education_verification_api(payload: EducationVerificationPayload) -> 
 
 
 @app.get("/api/verification/education/{verification_id}", tags=["G. Education Verification"])
-def get_education_verification_api(verification_id: str) -> dict[str, Any]:
+def get_education_verification_api(verification_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     try:
         return get_service().state.verification(verification_id)
     except KeyError as exc:
@@ -549,7 +636,7 @@ def process_education_reply_api(
 # ============================================================================
 
 @app.post("/api/verification/employment", status_code=201, tags=["H. Employment Verification"])
-def submit_employment_verification_api(payload: EmploymentVerificationPayload) -> dict[str, Any]:
+def submit_employment_verification_api(payload: EmploymentVerificationPayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, payload.workflow_id)
     vid = service.state.save_verification(
@@ -564,7 +651,7 @@ def submit_employment_verification_api(payload: EmploymentVerificationPayload) -
 
 
 @app.get("/api/verification/employment/{verification_id}", tags=["H. Employment Verification"])
-def get_employment_verification_api(verification_id: str) -> dict[str, Any]:
+def get_employment_verification_api(verification_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     try:
         return get_service().state.verification(verification_id)
     except KeyError as exc:
@@ -576,7 +663,7 @@ def get_employment_verification_api(verification_id: str) -> dict[str, Any]:
 # ============================================================================
 
 @app.post("/api/email/drafts", status_code=201, tags=["I. Email"])
-def create_email_draft_api(payload: EmailDraftPayload) -> dict[str, Any]:
+def create_email_draft_api(payload: EmailDraftPayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, payload.workflow_id)
     mid = service.state.save_email_message(
@@ -594,17 +681,17 @@ def create_email_draft_api(payload: EmailDraftPayload) -> dict[str, Any]:
 
 
 @app.get("/api/email/drafts", tags=["I. Email"])
-def list_email_drafts_api(workflow_id: str | None = None) -> list[dict[str, Any]]:
+def list_email_drafts_api(workflow_id: str | None = None, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return [m for m in get_service().state.list_email_messages(workflow_id) if m["status"] == "draft"]
 
 
 @app.get("/api/email/inbox", tags=["I. Email"])
-def get_email_inbox_api(workflow_id: str | None = None) -> list[dict[str, Any]]:
+def get_email_inbox_api(workflow_id: str | None = None, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return get_service().state.list_email_messages(workflow_id, direction="inbound")
 
 
 @app.get("/api/email/messages/{message_id}", tags=["I. Email"])
-def get_email_message_api(message_id: str) -> dict[str, Any]:
+def get_email_message_api(message_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     try:
         return get_service().state.email_message(message_id)
     except KeyError as exc:
@@ -612,12 +699,12 @@ def get_email_message_api(message_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/email/threads/{thread_id}", tags=["I. Email"])
-def get_email_thread_api(thread_id: str) -> list[dict[str, Any]]:
+def get_email_thread_api(thread_id: str, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return get_service().state.get_email_thread(thread_id)
 
 
 @app.post("/api/email/send/{draft_id}", tags=["I. Email"])
-def send_email_api(draft_id: str, role: str = Depends(get_current_user_role)) -> dict[str, Any]:
+def send_email_api(draft_id: str, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     msg = service.state.email_message(draft_id)
     if msg["status"] == "sent":
@@ -628,7 +715,7 @@ def send_email_api(draft_id: str, role: str = Depends(get_current_user_role)) ->
 
 
 @app.post("/api/email/mock-replies", status_code=201, tags=["I. Email"])
-def inject_mock_reply_api(payload: MockEmailReplyPayload) -> dict[str, Any]:
+def inject_mock_reply_api(payload: MockEmailReplyPayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, payload.workflow_id)
     return service.process_education_reply(
@@ -639,7 +726,7 @@ def inject_mock_reply_api(payload: MockEmailReplyPayload) -> dict[str, Any]:
 
 
 @app.get("/api/email/status/{message_id}", tags=["I. Email"])
-def get_email_status_api(message_id: str) -> dict[str, Any]:
+def get_email_status_api(message_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     msg = get_service().state.email_message(message_id)
     return {"message_id": message_id, "status": msg["status"], "outcome": msg.get("outcome")}
 
@@ -649,7 +736,7 @@ def get_email_status_api(message_id: str) -> dict[str, Any]:
 # ============================================================================
 
 @app.post("/api/finance/salary/calculate", tags=["J. Finance"])
-def calculate_salary_api(payload: SalaryCalculatePayload) -> dict[str, Any]:
+def calculate_salary_api(payload: SalaryCalculatePayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.FINANCE, Role.ADMIN))) -> dict[str, Any]:
     try:
         res = SalaryCalculationEngine.calculate(
             annual_ctc=payload.annual_ctc,
@@ -663,7 +750,7 @@ def calculate_salary_api(payload: SalaryCalculatePayload) -> dict[str, Any]:
 
 
 @app.get("/api/finance/salary/{employee_id}", tags=["J. Finance"])
-def get_employee_salary_api(employee_id: str) -> dict[str, Any]:
+def get_employee_salary_api(employee_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     try:
         return get_service().state.salary_profile(employee_id)
     except KeyError as exc:
@@ -671,12 +758,12 @@ def get_employee_salary_api(employee_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/finance/salary/validate", tags=["J. Finance"])
-def validate_salary_api(payload: SalaryValidatePayload) -> dict[str, Any]:
+def validate_salary_api(payload: SalaryValidatePayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.FINANCE, Role.ADMIN))) -> dict[str, Any]:
     return SalaryCalculationEngine.validate_structure(payload.structure, payload.approved_ctc)
 
 
 @app.post("/api/finance/payroll/prepare", status_code=201, tags=["J. Finance"])
-def prepare_payroll_api(payload: PayrollPreparePayload) -> dict[str, Any]:
+def prepare_payroll_api(payload: PayrollPreparePayload, _user: CurrentUser = Depends(require_roles(Role.FINANCE, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, payload.workflow_id)
     structure = SalaryCalculationEngine.calculate(payload.annual_ctc, allow_grade_override=True)
@@ -690,7 +777,7 @@ def prepare_payroll_api(payload: PayrollPreparePayload) -> dict[str, Any]:
 
 
 @app.get("/api/finance/payroll/{employee_id}", tags=["J. Finance"])
-def get_payroll_profile_api(employee_id: str) -> dict[str, Any]:
+def get_payroll_profile_api(employee_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     try:
         return get_service().state.salary_profile(employee_id)
     except KeyError as exc:
@@ -702,44 +789,58 @@ def get_payroll_profile_api(employee_id: str) -> dict[str, Any]:
 # ============================================================================
 
 @app.get("/api/approvals/pending", tags=["K. Human Approvals"])
-def get_pending_approvals_api(workflow_id: str | None = None) -> list[dict[str, Any]]:
+def get_pending_approvals_api(workflow_id: str | None = None, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return get_service().state.list_approvals(workflow_id=workflow_id, status="pending")
 
 
+@app.get("/api/approvals/history", tags=["K. Human Approvals"])
+def list_approvals_history_api(workflow_id: str | None = None, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
+    return get_service().state.list_approvals(workflow_id=workflow_id)
+
+
 @app.get("/api/approvals/{approval_id}", tags=["K. Human Approvals"])
-def get_approval_api(approval_id: str) -> dict[str, Any]:
+def get_approval_api(approval_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     try:
         return get_service().state.approval(approval_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
 
-@app.post("/approvals/{approval_id}", tags=["K. Human Approvals"])
-@app.post("/api/approvals/{approval_id}/approve", tags=["K. Human Approvals"])
-def approve_request_api(approval_id: str, payload: ApprovalPayload) -> dict[str, Any]:
+def _decide(approval_id: str, decision: str, payload: ApprovalPayload, user: CurrentUser) -> dict[str, Any]:
     service = get_service()
     try:
-        return service.decide_approval(approval_id, payload.reviewer, "approved", payload.comment)
+        approval = service.state.approval(approval_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    allowed = approval_roles_for(approval["action"])
+    if user.role not in allowed:
+        service.state.audit(
+            approval["workflow_id"], approval["task_id"], user.username, "approval_denied_unauthorized",
+            "forbidden", {"approval_id": approval_id, "role": user.role}, {"required_roles": sorted(allowed)},
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Action '{approval['action']}' requires one of roles: {', '.join(sorted(allowed))}",
+        )
+    if decision == "rejected" and not payload.comment.strip():
+        raise HTTPException(status_code=422, detail="A comment is required when rejecting an approval")
+    try:
+        return service.decide_approval(approval_id, user.username, decision, payload.comment, reviewer_role=user.role)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/approvals/{approval_id}", tags=["K. Human Approvals"])
+@app.post("/api/approvals/{approval_id}/approve", tags=["K. Human Approvals"])
+def approve_request_api(approval_id: str, payload: ApprovalPayload, user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
+    return _decide(approval_id, "approved", payload, user)
 
 
 @app.post("/api/approvals/{approval_id}/reject", tags=["K. Human Approvals"])
-def reject_request_api(approval_id: str, payload: ApprovalPayload) -> dict[str, Any]:
-    service = get_service()
-    try:
-        return service.decide_approval(approval_id, payload.reviewer, "rejected", payload.comment)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-
-
-@app.get("/api/approvals/history", tags=["K. Human Approvals"])
-def list_approvals_history_api(workflow_id: str | None = None) -> list[dict[str, Any]]:
-    return get_service().state.list_approvals(workflow_id=workflow_id)
+def reject_request_api(approval_id: str, payload: ApprovalPayload, user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
+    return _decide(approval_id, "rejected", payload, user)
 
 
 # ============================================================================
@@ -747,12 +848,12 @@ def list_approvals_history_api(workflow_id: str | None = None) -> list[dict[str,
 # ============================================================================
 
 @app.get("/api/red-flags", tags=["L. Red Flags"])
-def list_red_flags_api(status: str | None = None) -> list[dict[str, Any]]:
+def list_red_flags_api(status: str | None = None, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return get_service().state.list_red_flags(status=status)
 
 
 @app.get("/api/red-flags/{flag_id}", tags=["L. Red Flags"])
-def get_red_flag_api(flag_id: str) -> dict[str, Any]:
+def get_red_flag_api(flag_id: str, _user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
     try:
         return get_service().state.red_flag(flag_id)
     except KeyError as exc:
@@ -760,14 +861,14 @@ def get_red_flag_api(flag_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/workflows/{workflow_id}/red-flags", tags=["L. Red Flags"])
-def get_workflow_red_flags_api(workflow_id: str) -> list[dict[str, Any]]:
+def get_workflow_red_flags_api(workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     return service.state.list_red_flags(workflow_id=workflow_id)
 
 
 @app.post("/api/red-flags/{flag_id}/resolve", tags=["L. Red Flags"])
-def resolve_red_flag_api(flag_id: str, payload: RedFlagResolvePayload) -> dict[str, Any]:
+def resolve_red_flag_api(flag_id: str, payload: RedFlagResolvePayload, _user: CurrentUser = Depends(require_roles(Role.HR, Role.COMPLIANCE, Role.SECURITY, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     try:
         flag = service.state.resolve_red_flag(flag_id, payload.resolved_by, payload.resolution_comment)
@@ -786,7 +887,7 @@ def resolve_red_flag_api(flag_id: str, payload: RedFlagResolvePayload) -> dict[s
 # ============================================================================
 
 @app.get("/api/recovery/failed-tasks", tags=["M. Recovery"])
-def get_failed_tasks_api() -> list[dict[str, Any]]:
+def get_failed_tasks_api(_user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     service = get_service()
     workflows = service.state.list_workflows()
     failed = []
@@ -798,12 +899,12 @@ def get_failed_tasks_api() -> list[dict[str, Any]]:
 
 
 @app.get("/api/recovery/history", tags=["M. Recovery"])
-def get_recovery_history_api(workflow_id: str | None = None) -> list[dict[str, Any]]:
+def get_recovery_history_api(workflow_id: str | None = None, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     return get_service().state.list_recovery_records(workflow_id)
 
 
 @app.post("/api/recovery/tasks/{task_id}/retry", tags=["M. Recovery"])
-def retry_task_api(task_id: str, workflow_id: str = Query(...)) -> dict[str, Any]:
+def retry_task_api(task_id: str, workflow_id: str = Query(...), _user: CurrentUser = Depends(require_roles(Role.HR, Role.IT, Role.ADMIN))) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     service.state.update_task(workflow_id, task_id, "pending", error=None)
@@ -814,7 +915,8 @@ def retry_task_api(task_id: str, workflow_id: str = Query(...)) -> dict[str, Any
 def escalate_task_api(
     task_id: str,
     workflow_id: str = Query(...),
-    reason: str = Query(default="Manual escalation")
+    reason: str = Query(default="Manual escalation"),
+    _user: CurrentUser = Depends(require_roles(Role.HR, Role.IT, Role.ADMIN)),
 ) -> dict[str, Any]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
@@ -829,7 +931,7 @@ def escalate_task_api(
 # ============================================================================
 
 @app.get("/api/audit", tags=["N. Audit"])
-def list_all_audit_api(workflow_id: str | None = None) -> list[dict[str, Any]]:
+def list_all_audit_api(workflow_id: str | None = None, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     service = get_service()
     if workflow_id:
         return service.audit(workflow_id)
@@ -842,15 +944,15 @@ def list_all_audit_api(workflow_id: str | None = None) -> list[dict[str, Any]]:
 
 @app.get("/workflows/{workflow_id}/audit", tags=["N. Audit"])
 @app.get("/api/workflows/{workflow_id}/audit", tags=["N. Audit"])
-def get_workflow_audit_api(workflow_id: str) -> list[dict[str, Any]]:
+def get_workflow_audit_api(workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     service = get_service()
     _workflow_or_404(service, workflow_id)
     return service.audit(workflow_id)
 
 
 @app.get("/api/workflows/{workflow_id}/timeline", tags=["N. Audit"])
-def get_workflow_timeline_api(workflow_id: str) -> list[dict[str, Any]]:
-    events = get_workflow_audit_api(workflow_id)
+def get_workflow_timeline_api(workflow_id: str, _user: CurrentUser = Depends(get_current_user)) -> list[dict[str, Any]]:
+    events = get_workflow_audit_api(workflow_id, _user)
     timeline = []
     for e in events:
         timeline.append({
