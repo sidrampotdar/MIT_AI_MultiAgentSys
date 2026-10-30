@@ -14,3 +14,4 @@ uploads/
 __pycache__/
 node_modules/
 web/dist/
+*.tsbuildinfo
