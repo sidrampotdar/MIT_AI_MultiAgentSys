@@ -85,6 +85,13 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(candidate.hex(), digest_hex)
 
 
+# Cost-equivalent hash used when the username is unknown (see login).
+DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(16))
+
+STREAM_AUDIENCE = "workflow-stream"
+STREAM_TICKET_TTL = timedelta(seconds=60)
+
+
 # --- Tokens ---
 
 _generated_secret: str | None = None
@@ -116,7 +123,25 @@ def create_access_token(username: str, role: str, ttl: timedelta | None = None) 
 
 
 def decode_access_token(token: str) -> dict:
+    # No audience is accepted here, so stream tickets (which carry one) are rejected.
     return jwt.decode(token, _jwt_secret(), algorithms=[JWT_ALGORITHM], options={"require": ["exp", "sub"]})
+
+
+def create_stream_ticket(username: str, workflow_id: str) -> tuple[str, datetime]:
+    expires = datetime.now(timezone.utc) + STREAM_TICKET_TTL
+    ticket = jwt.encode(
+        {"sub": username, "wid": workflow_id, "aud": STREAM_AUDIENCE, "exp": expires},
+        _jwt_secret(),
+        algorithm=JWT_ALGORITHM,
+    )
+    return ticket, expires
+
+
+def decode_stream_ticket(ticket: str) -> dict:
+    return jwt.decode(
+        ticket, _jwt_secret(), algorithms=[JWT_ALGORITHM], audience=STREAM_AUDIENCE,
+        options={"require": ["exp", "sub", "aud", "wid"]},
+    )
 
 
 # --- Request dependencies ---
@@ -126,6 +151,7 @@ class CurrentUser:
     username: str
     role: str
     full_name: str
+    stream_workflow_id: str | None = None
 
 
 def _unauthorized(detail: str) -> HTTPException:
@@ -148,8 +174,14 @@ def _resolve_user(token: str | None) -> CurrentUser:
         raise _unauthorized("Token has expired")
     except jwt.InvalidTokenError:
         raise _unauthorized("Invalid token")
+    return _resolve_user_by_name(claims["sub"])
+
+
+def _resolve_user_by_name(username: str) -> CurrentUser:
+    from app.api import get_service
+
     try:
-        user = get_service().state.user(claims["sub"])
+        user = get_service().state.user(username)
     except KeyError:
         raise _unauthorized("Unknown user")
     if not user["is_active"]:
@@ -163,13 +195,22 @@ def get_current_user(request: Request) -> CurrentUser:
     return _resolve_user(token if scheme.lower() == "bearer" else None)
 
 
-def get_current_user_for_stream(request: Request, access_token: str | None = Query(default=None)) -> CurrentUser:
-    """EventSource cannot set headers, so the stream also accepts a query token."""
+def get_current_user_for_stream(request: Request, ticket: str | None = Query(default=None)) -> CurrentUser:
+    """Bearer header, or a short-lived workflow-scoped ticket (EventSource cannot set headers)."""
     header = request.headers.get("authorization", "")
     scheme, _, token = header.partition(" ")
     if scheme.lower() == "bearer" and token:
         return _resolve_user(token)
-    return _resolve_user(access_token)
+    if not ticket:
+        raise _unauthorized("Authentication required")
+    try:
+        claims = decode_stream_ticket(ticket)
+    except jwt.ExpiredSignatureError:
+        raise _unauthorized("Stream ticket has expired")
+    except jwt.InvalidTokenError:
+        raise _unauthorized("Invalid stream ticket")
+    user = _resolve_user_by_name(claims["sub"])
+    return CurrentUser(user.username, user.role, user.full_name, stream_workflow_id=claims["wid"])
 
 
 def require_roles(*roles: Role) -> Callable[..., CurrentUser]:

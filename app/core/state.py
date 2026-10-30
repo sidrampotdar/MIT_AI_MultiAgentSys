@@ -143,6 +143,51 @@ class WorkflowStateStore:
                 status TEXT NOT NULL,
                 timestamp TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS documents (
+                document_id TEXT PRIMARY KEY,
+                workflow_id TEXT,
+                employee_email TEXT NOT NULL,
+                doc_type TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                storage_path TEXT,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                extraction_status TEXT NOT NULL DEFAULT 'none',
+                extraction_json TEXT,
+                authenticity TEXT NOT NULL DEFAULT 'unverified',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tool_executions (
+                execution_id TEXT PRIMARY KEY,
+                workflow_id TEXT,
+                task_id TEXT,
+                agent TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                idempotency_key TEXT,
+                approval_id TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_exec_key ON tool_executions (idempotency_key, success);
+            CREATE TABLE IF NOT EXISTS workflow_state (
+                workflow_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (workflow_id, key)
+            );
+            CREATE TABLE IF NOT EXISTS request_keys (
+                idempotency_key TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
                 password_hash TEXT NOT NULL,
@@ -168,6 +213,18 @@ class WorkflowStateStore:
             );
         """)
         self.connection.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive, idempotent column migrations for databases created by earlier versions."""
+        def columns(table: str) -> set[str]:
+            return {row["name"] for row in self.connection.execute(f"PRAGMA table_info({table})")}
+
+        task_columns = columns("tasks")
+        for name, ddl in (("started_at", "TEXT"), ("completed_at", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0")):
+            if name not in task_columns:
+                self.connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {ddl}")
+        self.connection.commit()
 
     # --- Workflows & Tasks ---
 
@@ -180,7 +237,7 @@ class WorkflowStateStore:
         )
         for task in plan:
             self.connection.execute(
-                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO tasks (workflow_id, task_id, agent, status, depends_on_json, result_json, error, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (workflow_id, task["task_id"], task["agent"], "pending", json.dumps(task.get("depends_on", [])), None, None, now)
             )
         self.connection.commit()
@@ -212,11 +269,28 @@ class WorkflowStateStore:
         return [{**dict(row), "depends_on": json.loads(row["depends_on_json"]), "result": json.loads(row["result_json"]) if row["result_json"] else None} for row in rows]
 
     def update_task(self, workflow_id: str, task_id: str, status: str, result: dict[str, Any] | None = None, error: str | None = None) -> None:
+        now = _now()
         self.connection.execute(
             "UPDATE tasks SET status=?, result_json=?, error=?, updated_at=? WHERE workflow_id=? AND task_id=?",
-            (status, json.dumps(result) if result is not None else None, error, _now(), workflow_id, task_id)
+            (status, json.dumps(result) if result is not None else None, error, now, workflow_id, task_id)
         )
+        if status == "in_progress":
+            self.connection.execute(
+                "UPDATE tasks SET started_at=?, completed_at=NULL, attempts=attempts+1 WHERE workflow_id=? AND task_id=?",
+                (now, workflow_id, task_id),
+            )
+        elif status in {"completed", "failed", "blocked", "escalated", "skipped", "denied", "cancelled"}:
+            self.connection.execute(
+                "UPDATE tasks SET completed_at=? WHERE workflow_id=? AND task_id=?", (now, workflow_id, task_id)
+            )
         self.connection.execute("UPDATE workflows SET updated_at=? WHERE workflow_id=?", (_now(), workflow_id))
+        self.connection.commit()
+
+    def update_workflow_employee(self, workflow_id: str, employee: dict[str, Any]) -> None:
+        self.connection.execute(
+            "UPDATE workflows SET employee_json=?, updated_at=? WHERE workflow_id=?",
+            (json.dumps(employee), _now(), workflow_id),
+        )
         self.connection.commit()
 
     def update_workflow_status(self, workflow_id: str, status: str) -> None:
@@ -233,7 +307,7 @@ class WorkflowStateStore:
         for task in new_plan:
             if task["task_id"] not in existing_tasks:
                 self.connection.execute(
-                    "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO tasks (workflow_id, task_id, agent, status, depends_on_json, result_json, error, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (workflow_id, task["task_id"], task["agent"], "pending", json.dumps(task.get("depends_on", [])), None, None, now)
                 )
         self.connection.commit()
@@ -334,6 +408,13 @@ class WorkflowStateStore:
         )
         self.connection.commit()
         return self.approval(approval_id)
+
+    def mark_approval(self, approval_id: str, status: str, comment: str | None = None) -> None:
+        self.connection.execute(
+            "UPDATE approvals SET status=?, comment=COALESCE(?, comment), reviewed_at=? WHERE approval_id=?",
+            (status, comment, _now(), approval_id),
+        )
+        self.connection.commit()
 
     # --- Red Flags ---
 
@@ -586,6 +667,121 @@ class WorkflowStateStore:
         query += " ORDER BY timestamp DESC"
         rows = self.connection.execute(query, params).fetchall()
         return [dict(r) for r in rows]
+
+    # --- Documents ---
+
+    def save_document(
+        self, employee_email: str, doc_type: str, filename: str, content_type: str, size_bytes: int,
+        sha256_hex: str, storage_path: str | None, source: str, workflow_id: str | None = None,
+        status: str = "uploaded",
+    ) -> dict[str, Any]:
+        document_id = f"DOC-{uuid4().hex[:10].upper()}"
+        self.connection.execute(
+            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none', NULL, 'unverified', ?)",
+            (document_id, workflow_id, employee_email.lower(), doc_type, filename, content_type, size_bytes,
+             sha256_hex, storage_path, source, status, _now()),
+        )
+        self.connection.commit()
+        return self.document(document_id)
+
+    def document(self, document_id: str) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM documents WHERE document_id=?", (document_id,)).fetchone()
+        if not row:
+            raise KeyError(f"Document {document_id} was not found")
+        return self._document_row(row)
+
+    @staticmethod
+    def _document_row(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["extraction"] = json.loads(d.pop("extraction_json")) if d.get("extraction_json") else None
+        d.pop("storage_path", None)
+        return d
+
+    def list_documents(self, employee_email: str | None = None, workflow_id: str | None = None) -> list[dict[str, Any]]:
+        query, params = "SELECT * FROM documents WHERE 1=1", []
+        if employee_email:
+            query += " AND employee_email=?"
+            params.append(employee_email.lower())
+        if workflow_id:
+            query += " AND workflow_id=?"
+            params.append(workflow_id)
+        rows = self.connection.execute(query + " ORDER BY created_at", params).fetchall()
+        return [self._document_row(r) for r in rows]
+
+    def update_document(self, document_id: str, status: str | None = None, extraction: dict[str, Any] | None = None) -> dict[str, Any]:
+        if status is not None:
+            self.connection.execute("UPDATE documents SET status=? WHERE document_id=?", (status, document_id))
+        if extraction is not None:
+            self.connection.execute(
+                "UPDATE documents SET extraction_json=?, extraction_status='extracted' WHERE document_id=?",
+                (json.dumps(extraction), document_id),
+            )
+        self.connection.commit()
+        return self.document(document_id)
+
+    def attach_documents_to_workflow(self, employee_email: str, workflow_id: str) -> None:
+        self.connection.execute(
+            "UPDATE documents SET workflow_id=? WHERE employee_email=? AND workflow_id IS NULL",
+            (workflow_id, employee_email.lower()),
+        )
+        self.connection.commit()
+
+    # --- Tool executions (durable idempotency + inspection) ---
+
+    def cached_tool_result(self, idempotency_key: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT result_json FROM tool_executions WHERE idempotency_key=? AND success=1 ORDER BY rowid DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        return json.loads(row["result_json"]) if row else None
+
+    def record_tool_execution(
+        self, workflow_id: str | None, task_id: str | None, agent: str, tool: str, arguments: dict[str, Any],
+        result: dict[str, Any], idempotency_key: str | None, approval_id: str | None, started_at: str,
+    ) -> str:
+        execution_id = f"TEX-{uuid4().hex[:10].upper()}"
+        self.connection.execute(
+            "INSERT INTO tool_executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (execution_id, workflow_id, task_id, agent, tool, json.dumps(arguments, default=str),
+             json.dumps(result, default=str), int(bool(result.get("success"))), idempotency_key, approval_id,
+             started_at, _now()),
+        )
+        self.connection.commit()
+        return execution_id
+
+    def list_tool_executions(self, workflow_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM tool_executions WHERE workflow_id=? ORDER BY rowid", (workflow_id,)
+        ).fetchall()
+        return [
+            {**{k: v for k, v in dict(r).items() if k not in ("arguments_json", "result_json")},
+             "success": bool(r["success"]), "arguments": json.loads(r["arguments_json"]), "result": json.loads(r["result_json"])}
+            for r in rows
+        ]
+
+    # --- Shared workflow memory ---
+
+    def set_state(self, workflow_id: str, key: str, value: Any, updated_by: str) -> None:
+        self.connection.execute(
+            "INSERT INTO workflow_state VALUES (?, ?, ?, ?, ?) ON CONFLICT(workflow_id, key) DO UPDATE SET "
+            "value_json=excluded.value_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+            (workflow_id, key, json.dumps(value, default=str), updated_by, _now()),
+        )
+        self.connection.commit()
+
+    def get_state(self, workflow_id: str) -> dict[str, Any]:
+        rows = self.connection.execute("SELECT * FROM workflow_state WHERE workflow_id=? ORDER BY key", (workflow_id,)).fetchall()
+        return {r["key"]: {"value": json.loads(r["value_json"]), "updated_by": r["updated_by"], "updated_at": r["updated_at"]} for r in rows}
+
+    # --- Request idempotency keys ---
+
+    def request_key_workflow(self, key: str) -> str | None:
+        row = self.connection.execute("SELECT workflow_id FROM request_keys WHERE idempotency_key=?", (key,)).fetchone()
+        return row["workflow_id"] if row else None
+
+    def save_request_key(self, key: str, workflow_id: str) -> None:
+        self.connection.execute("INSERT OR IGNORE INTO request_keys VALUES (?, ?, ?)", (key, workflow_id, _now()))
+        self.connection.commit()
 
     # --- Users ---
 

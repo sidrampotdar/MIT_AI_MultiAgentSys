@@ -7,6 +7,7 @@ approval requirements, and idempotency keys. Agents cannot execute arbitrary cod
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Callable
@@ -37,6 +38,10 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, RegisteredTool] = {}
         self._idempotent_results: dict[str, dict[str, Any]] = {}
+        # Wired by OnboardingService: durable store + approval check. Without a
+        # verifier, tools that require approval refuse to run at all.
+        self.state: Any = None
+        self.approval_verifier: Callable[[str | None, str, dict[str, Any]], tuple[bool, str]] | None = None
 
     def register(self, tool: RegisteredTool) -> None:
         if tool.name in self._tools:
@@ -78,7 +83,26 @@ class ToolRegistry:
         agent: str,
         name: str,
         arguments: dict[str, Any],
-        idempotency_key: str | None = None
+        idempotency_key: str | None = None,
+        approval_id: str | None = None,
+        workflow_id: str | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        started = datetime.now(timezone.utc).isoformat()
+        result = self._execute(agent, name, arguments, idempotency_key, approval_id)
+        if self.state is not None and not result.get("idempotent_replay"):
+            self.state.record_tool_execution(
+                workflow_id, task_id, agent, name, arguments, result, idempotency_key, approval_id, started
+            )
+        return result
+
+    def _execute(
+        self,
+        agent: str,
+        name: str,
+        arguments: dict[str, Any],
+        idempotency_key: str | None,
+        approval_id: str | None,
     ) -> dict[str, Any]:
         tool = self._tools.get(name)
         if not tool:
@@ -90,6 +114,15 @@ class ToolRegistry:
                 "error_code": "UNAUTHORIZED_TOOL",
                 "message": f"{agent} is not authorized to execute tool '{name}'",
             }
+
+        # Sensitive tools never run without a valid, current, approved approval.
+        if tool.requires_approval:
+            if self.approval_verifier is None:
+                return {"success": False, "error_code": "APPROVAL_REQUIRED",
+                        "message": f"Tool '{name}' requires human approval and no approval gate is configured"}
+            allowed, reason = self.approval_verifier(approval_id, name, arguments)
+            if not allowed:
+                return {"success": False, "error_code": "APPROVAL_REQUIRED", "message": reason}
 
         # Validate required arguments
         required = tool.schema.get("required", [])
@@ -103,8 +136,10 @@ class ToolRegistry:
 
         # Idempotency check
         key = idempotency_key or sha256(f"{agent}:{name}:{sorted(arguments.items(), key=lambda x: str(x[0]))}".encode()).hexdigest()
-        if tool.idempotent and key in self._idempotent_results:
-            return {**self._idempotent_results[key], "idempotent_replay": True}
+        if tool.idempotent:
+            cached = self.state.cached_tool_result(key) if self.state is not None else self._idempotent_results.get(key)
+            if cached is not None:
+                return {**cached, "idempotent_replay": True}
 
         try:
             handler_result = tool.handler(**arguments)
@@ -117,7 +152,8 @@ class ToolRegistry:
         except Exception as exc:
             result = {"success": False, "error_code": "TOOL_EXECUTION_ERROR", "message": str(exc)}
 
-        if tool.idempotent:
+        # Only successes are cached: a failed attempt must stay retryable.
+        if tool.idempotent and result.get("success") and self.state is None:
             self._idempotent_results[key] = result
         return result
 

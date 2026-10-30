@@ -101,3 +101,32 @@ def test_admin_cannot_demote_self_and_unknown_role_is_rejected(api):
     assert api.patch("/api/users/hr", json={"role": "wizard"}, headers=admin).status_code == 422
     assert api.patch("/api/users/hr", json={"is_active": False}, headers=admin).status_code == 200
     assert api.post("/api/auth/login", json={"username": "hr", "password": "correct-horse-battery"}).status_code == 401
+
+
+def test_every_route_except_health_and_login_requires_authentication(api):
+    """Route audit: no endpoint is reachable anonymously by accident."""
+    from fastapi.routing import APIRoute
+
+    public = {"/health", "/api/health", "/api/auth/login"}
+    for route in api.app.routes:
+        if not isinstance(route, APIRoute) or route.path in public:
+            continue
+        path = route.path.replace("{", "x").replace("}", "")
+        for method in route.methods - {"HEAD", "OPTIONS"}:
+            response = api.request(method, path)
+            assert response.status_code == 401, f"{method} {route.path} -> {response.status_code}"
+
+
+def test_stream_ticket_is_scoped_short_lived_and_not_a_bearer_token(api):
+    hr = api.login("hr")
+    wid = api.post("/api/workflows/onboarding", json=ONBOARD, headers=hr).json()["workflow_id"]
+    ticket = api.post("/api/auth/stream-ticket", params={"workflow_id": wid}, headers=hr).json()["ticket"]
+    # A ticket cannot be used as a normal bearer token on other endpoints.
+    assert api.get("/api/workflows", headers={"Authorization": f"Bearer {ticket}"}).status_code == 401
+    # It is bound to its workflow.
+    other = api.post("/api/workflows/onboarding", json={**ONBOARD, "email": "b@example.test"}, headers=hr).json()["workflow_id"]
+    assert api.get(f"/api/workflows/{other}/events", params={"ticket": ticket}).status_code == 403
+    # Access tokens are no longer accepted in the query string.
+    token = hr["Authorization"].split()[1]
+    assert api.get(f"/api/workflows/{wid}/events", params={"access_token": token}).status_code == 401
+    assert api.post("/api/auth/stream-ticket", params={"workflow_id": wid}).status_code == 401

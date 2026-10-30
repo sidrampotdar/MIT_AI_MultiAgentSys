@@ -30,6 +30,8 @@ from app.auth import (
     create_access_token,
     get_current_user,
     get_current_user_for_stream,
+    DUMMY_PASSWORD_HASH,
+    create_stream_ticket,
     hash_password,
     require_roles,
     verify_password,
@@ -227,8 +229,10 @@ def login_api(payload: LoginPayload) -> dict[str, Any]:
         user = service.state.user(payload.username)
     except KeyError:
         user = None
-    # Same response for unknown user, wrong password and deactivated account.
-    if not user or not user["is_active"] or not verify_password(payload.password, user["password_hash"]):
+    # Always pay for one password hash so response time does not reveal whether the
+    # account exists or is active; unknown, inactive and wrong-password look identical.
+    password_ok = verify_password(payload.password, user["password_hash"] if user else DUMMY_PASSWORD_HASH)
+    if not user or not user["is_active"] or not password_ok:
         raise HTTPException(status_code=401, detail="Invalid username or password", headers={"WWW-Authenticate": "Bearer"})
     token, expires = create_access_token(user["username"], user["role"])
     return {
@@ -237,6 +241,18 @@ def login_api(payload: LoginPayload) -> dict[str, Any]:
         "expires_at": expires.isoformat(),
         "user": {"username": user["username"], "role": user["role"], "full_name": user["full_name"]},
     }
+
+
+@app.post("/api/auth/stream-ticket", tags=["0. Auth"])
+def stream_ticket_api(workflow_id: str = Query(...), user: CurrentUser = Depends(get_current_user)) -> dict[str, Any]:
+    """Short-lived ticket for EventSource, which cannot send an Authorization header.
+
+    The ticket is scoped to one workflow and ~60 seconds and is rejected by every
+    other endpoint, so the long-lived access token never appears in a URL.
+    """
+    _workflow_or_404(get_service(), workflow_id)
+    ticket, expires = create_stream_ticket(user.username, workflow_id)
+    return {"ticket": ticket, "expires_at": expires.isoformat()}
 
 
 @app.get("/api/auth/me", tags=["0. Auth"])
@@ -507,6 +523,8 @@ async def sse_workflow_events(
     last_event_id: int | None = Query(default=None, ge=0),
     _user: CurrentUser = Depends(get_current_user_for_stream),
 ) -> StreamingResponse:
+    if _user.stream_workflow_id not in (None, workflow_id):
+        raise HTTPException(status_code=403, detail="Stream ticket is not valid for this workflow")
     """Long-lived, reconnectable Server-Sent Events stream of persisted workflow events."""
     service = get_service()
     _workflow_or_404(service, workflow_id)
@@ -515,7 +533,7 @@ async def sse_workflow_events(
     return StreamingResponse(
         workflow_event_stream(service, workflow_id, cursor, request.is_disconnected),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive", "Referrer-Policy": "no-referrer"},
     )
 
 
@@ -661,7 +679,8 @@ def get_education_verification_api(verification_id: str, _user: CurrentUser = De
 @app.post("/api/verification/education/{verification_id}/process-reply", tags=["G. Education Verification"])
 def process_education_reply_api(
     verification_id: str,
-    outcome: Literal["confirmed", "year_mismatch", "ambiguous", "prompt_injection"] = "confirmed"
+    outcome: Literal["confirmed", "year_mismatch", "ambiguous", "prompt_injection"] = "confirmed",
+    _user: CurrentUser = Depends(require_roles(Role.HR, Role.ADMIN)),
 ) -> dict[str, Any]:
     service = get_service()
     ver = service.state.verification(verification_id)
