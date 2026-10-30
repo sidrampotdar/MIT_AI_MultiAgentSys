@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import (
@@ -18,6 +20,9 @@ from app.models.enums import (
     ApprovalDecision,
     ApprovalStatus,
     AuditEventType,
+    RedFlagCategory,
+    RedFlagSeverity,
+    VerificationStatus,
 )
 
 
@@ -27,6 +32,8 @@ class AppBaseModel(BaseModel):
         str_strip_whitespace=True,
         validate_assignment=True,
     )
+
+
 class EmployeeProfile(AppBaseModel):
     department: str
     designation: str
@@ -37,8 +44,18 @@ class EmployeeProfile(AppBaseModel):
 
     location: str
     salary: float | None = Field(default=None, gt=0)
+    annual_ctc: int | None = Field(default=None, gt=0)
 
     joining_date: date
+    university: str | None = None
+    degree: str | None = None
+    branch: str | None = None
+    graduation_year: int | None = None
+    enrollment_number: str | None = None
+    previous_employer: str | None = None
+    previous_designation: str | None = None
+    previous_employment_dates: str | None = None
+    consent_to_verify: bool = True
 
 
 class Employee(AppBaseModel):
@@ -55,6 +72,12 @@ class Employee(AppBaseModel):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}"
+
+
 class OnboardingRequest(AppBaseModel):
     request_id: UUID = Field(default_factory=uuid4)
 
@@ -90,6 +113,7 @@ class WorkflowStep(AppBaseModel):
 
     result: dict[str, Any] | None = None
     error: str | None = None
+    approval_action: str | None = None
 
     @model_validator(mode="after")
     def validate_retries(self):
@@ -103,12 +127,7 @@ class WorkflowStep(AppBaseModel):
             raise ValueError("Duplicate task dependencies are not allowed")
 
         return self
-    
-step = WorkflowStep(
-    description="Verify employee identity documents",
-    assigned_agent=AgentName.DOCUMENT,
-    required_tools=["document_verification"],
-)
+
 
 class WorkflowPlan(AppBaseModel):
     plan_id: UUID = Field(default_factory=uuid4)
@@ -169,6 +188,7 @@ class WorkflowPlan(AppBaseModel):
 
         return self
 
+
 class AgentTask(AppBaseModel):
     assignment_id: UUID = Field(default_factory=uuid4)
 
@@ -185,6 +205,8 @@ class AgentTask(AppBaseModel):
     assigned_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+
+
 class ToolCall(AppBaseModel):
     tool_call_id: UUID = Field(default_factory=uuid4)
 
@@ -198,7 +220,9 @@ class ToolCall(AppBaseModel):
 
     error: str | None = None
 
-    executed_at: datetime | None = None 
+    executed_at: datetime | None = None
+
+
 class AgentResult(AppBaseModel):
     result_id: UUID = Field(default_factory=uuid4)
 
@@ -238,6 +262,18 @@ class AgentResult(AppBaseModel):
         return self
 
 
+class AgentMessage(AppBaseModel):
+    message_id: str = Field(default_factory=lambda: f"MSG-{uuid4().hex[:10].upper()}")
+    workflow_id: str
+    sender_agent: str
+    recipient_agent: str
+    task_id: str | None = None
+    correlation_id: str = Field(default_factory=lambda: f"CORR-{uuid4().hex[:10].upper()}")
+    message_type: str = "request"  # request, response, event, delegation
+    content: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 
 class ApprovalRequest(AppBaseModel):
     approval_id: UUID = Field(default_factory=uuid4)
@@ -261,6 +297,7 @@ class ApprovalRequest(AppBaseModel):
 
     expires_at: datetime | None = None
 
+
 class ApprovalResult(AppBaseModel):
     approval_id: UUID
 
@@ -282,6 +319,120 @@ class ApprovalResult(AppBaseModel):
             )
 
         return self
+
+
+class RedFlag(AppBaseModel):
+    flag_id: str = Field(default_factory=lambda: f"FLAG-{uuid4().hex[:10].upper()}")
+    workflow_id: str
+    category: RedFlagCategory
+    severity: RedFlagSeverity
+    description: str
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    detection_method: str = "rule_based"  # rule_based, llm_assisted
+    recommended_action: str
+    status: str = "active"  # active, resolved, dismissed
+    resolution_comment: str | None = None
+    resolved_by: str | None = None
+    resolved_at: datetime | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class EmailMessage(AppBaseModel):
+    message_id: str = Field(default_factory=lambda: f"EML-{uuid4().hex[:10].upper()}")
+    thread_id: str
+    workflow_id: str
+    direction: Literal["inbound", "outbound"]
+    sender: str
+    recipient: str
+    subject: str
+    body: str
+    status: str = "draft"  # draft, waiting_approval, approved, sent, delivered, received, quarantined
+    outcome: str | None = None  # confirmed, year_mismatch, ambiguous, etc.
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    sent_at: datetime | None = None
+
+
+class EmailDraft(AppBaseModel):
+    draft_id: str = Field(default_factory=lambda: f"DFT-{uuid4().hex[:10].upper()}")
+    workflow_id: str
+    recipient: str
+    subject: str
+    body: str
+    purpose: str
+    approval_id: str | None = None
+    status: str = "pending_approval"
+
+
+class SalaryStructure(AppBaseModel):
+    annual_ctc: int = Field(gt=0)
+    basic: int = Field(gt=0)
+    hra: int = Field(ge=0)
+    special_allowance: int = Field(ge=0)
+    employer_pf: int = Field(ge=0)
+    employee_pf: int = Field(ge=0)
+    applicable_deductions: int = Field(default=0, ge=0)
+    other_benefits: int = Field(default=0, ge=0)
+    monthly_gross: int = Field(gt=0)
+    estimated_net_salary: int = Field(gt=0)
+    tax_assumptions: dict[str, Any] = Field(default_factory=dict)
+    reconciled: bool = True
+
+
+class PayrollProfile(AppBaseModel):
+    profile_id: str = Field(default_factory=lambda: f"PAY-{uuid4().hex[:10].upper()}")
+    workflow_id: str
+    employee_id: str
+    employee_email: str
+    salary_structure: SalaryStructure
+    status: str = "pending_approval"  # pending_approval, approved, finalized, rejected
+    approved_by: str | None = None
+    approved_at: datetime | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class EducationVerificationRecord(AppBaseModel):
+    verification_id: str = Field(default_factory=lambda: f"EDU-{uuid4().hex[:10].upper()}")
+    workflow_id: str
+    candidate_name: str
+    institution: str
+    enrollment_number: str
+    degree: str
+    branch: str
+    graduation_year: int
+    status: VerificationStatus = VerificationStatus.NOT_STARTED
+    request_message_id: str | None = None
+    reply_message_id: str | None = None
+    notes: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class EmploymentVerificationRecord(AppBaseModel):
+    verification_id: str = Field(default_factory=lambda: f"EMPVER-{uuid4().hex[:10].upper()}")
+    workflow_id: str
+    candidate_name: str
+    previous_employer: str
+    designation: str
+    employment_dates: str
+    status: VerificationStatus = VerificationStatus.NOT_STARTED
+    request_message_id: str | None = None
+    reply_message_id: str | None = None
+    notes: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RecoveryRecord(AppBaseModel):
+    recovery_id: str = Field(default_factory=lambda: f"REC-{uuid4().hex[:10].upper()}")
+    workflow_id: str
+    task_id: str
+    attempt: int
+    max_retries: int
+    error_type: str
+    error_message: str
+    action_taken: str
+    status: str = "in_progress"  # in_progress, recovered, escalated, failed
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 
 class WorkflowState(AppBaseModel):
     workflow_id: UUID = Field(default_factory=uuid4)
@@ -340,6 +491,8 @@ class WorkflowState(AppBaseModel):
                 )
 
         return self
+
+
 class AuditEvent(AppBaseModel):
     event_id: UUID = Field(default_factory=uuid4)
 
@@ -357,4 +510,4 @@ class AuditEvent(AppBaseModel):
 
     timestamp: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
-    )   
+    )

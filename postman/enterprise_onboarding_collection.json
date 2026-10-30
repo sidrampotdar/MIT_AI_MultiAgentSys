@@ -1,0 +1,471 @@
+{
+  "info": {
+    "name": "Enterprise Autonomous Onboarding & Verification System",
+    "description": "Complete Postman test collection for testing the entire multi-agent onboarding, verification, approval, salary, red-flag, and recovery AI pipeline.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. System & LLM APIs",
+      "item": [
+        {
+          "name": "1.1 Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/health", "host": ["{{baseUrl}}"], "path": ["api", "health"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status code is 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Health status ok', function () { pm.expect(pm.response.json().status).to.eql('ok'); });"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.2 System Info",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/system/info", "host": ["{{baseUrl}}"], "path": ["api", "system", "info"] }
+          }
+        },
+        {
+          "name": "1.3 List LLM Providers",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/llm/providers", "host": ["{{baseUrl}}"], "path": ["api", "llm", "providers"] }
+          }
+        },
+        {
+          "name": "1.4 Test Gemini Live Provider",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"provider\": \"gemini\",\n  \"prompt\": \"Verify candidate degree in 5 words\",\n  \"system_message\": \"You are an enterprise AI verifier.\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/llm/test", "host": ["{{baseUrl}}"], "path": ["api", "llm", "test"] }
+          }
+        },
+        {
+          "name": "1.5 Test Grok / Groq Live Provider",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"provider\": \"groq\",\n  \"prompt\": \"Explain employee verification in 5 words\",\n  \"system_message\": \"You are an enterprise AI verifier.\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/llm/test", "host": ["{{baseUrl}}"], "path": ["api", "llm", "test"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Employee Management",
+      "item": [
+        {
+          "name": "2.1 Create Employee Record",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"first_name\": \"Rahul\",\n  \"last_name\": \"Sharma\",\n  \"email\": \"rahul.sharma@enterprise.test\",\n  \"department\": \"Platform Engineering\",\n  \"designation\": \"Software Engineer\",\n  \"annual_ctc\": 1200000,\n  \"location\": \"Bengaluru\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/employees", "host": ["{{baseUrl}}"], "path": ["api", "employees"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  var data = pm.response.json();",
+                  "  pm.environment.set('employeeId', data.employee_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.2 List Employees",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/employees", "host": ["{{baseUrl}}"], "path": ["api", "employees"] }
+          }
+        },
+        {
+          "name": "2.3 Get Employee by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/employees/{{employeeId}}", "host": ["{{baseUrl}}"], "path": ["api", "employees", "{{employeeId}}"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Workflow Orchestration",
+      "item": [
+        {
+          "name": "3.1 Start Onboarding Workflow",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"goal\": \"Onboard Rahul Sharma as Software Engineer in Platform Engineering with complete qualification verification and payroll setup\",\n  \"name\": \"Rahul Sharma\",\n  \"email\": \"rahul.sharma@enterprise.test\",\n  \"department\": \"Platform Engineering\",\n  \"designation\": \"Software Engineer\",\n  \"annual_ctc\": 1200000,\n  \"university\": \"ABC Engineering College\",\n  \"enrollment_number\": \"SYN-2020-1045\",\n  \"degree\": \"BTech\",\n  \"branch\": \"Computer Science Engineering\",\n  \"graduation_year\": 2024,\n  \"previous_employer\": \"Tech Innovators Inc\",\n  \"previous_designation\": \"Junior Engineer\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/workflows/onboarding", "host": ["{{baseUrl}}"], "path": ["api", "workflows", "onboarding"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  var data = pm.response.json();",
+                  "  pm.environment.set('workflowId', data.workflow_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.2 Get Workflow Status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/workflows/{{workflowId}}", "host": ["{{baseUrl}}"], "path": ["api", "workflows", "{{workflowId}}"] }
+          }
+        },
+        {
+          "name": "3.3 Get Workflow Tasks",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/workflows/{{workflowId}}/tasks", "host": ["{{baseUrl}}"], "path": ["api", "workflows", "{{workflowId}}", "tasks"] }
+          }
+        },
+        {
+          "name": "3.4 Pause Workflow",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/workflows/{{workflowId}}/pause", "host": ["{{baseUrl}}"], "path": ["api", "workflows", "{{workflowId}}", "pause"] }
+          }
+        },
+        {
+          "name": "3.5 Resume Workflow",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/workflows/{{workflowId}}/resume", "host": ["{{baseUrl}}"], "path": ["api", "workflows", "{{workflowId}}", "resume"] }
+          }
+        },
+        {
+          "name": "3.6 Re-plan Workflow",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Candidate requested updated designation to Senior Platform Engineer\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/workflows/{{workflowId}}/replan", "host": ["{{baseUrl}}"], "path": ["api", "workflows", "{{workflowId}}", "replan"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Multi-Agent & Communication",
+      "item": [
+        {
+          "name": "4.1 List Registered Agents",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/agents", "host": ["{{baseUrl}}"], "path": ["api", "agents"] }
+          }
+        },
+        {
+          "name": "4.2 Get Agent Details",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/agents/education_verification_agent", "host": ["{{baseUrl}}"], "path": ["api", "agents", "education_verification_agent"] }
+          }
+        },
+        {
+          "name": "4.3 Inspect Workflow Agent Messages",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/workflows/{{workflowId}}/agent-messages", "host": ["{{baseUrl}}"], "path": ["api", "workflows", "{{workflowId}}", "agent-messages"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Tool Registry & Permissions",
+      "item": [
+        {
+          "name": "5.1 List Registered Enterprise Tools",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/tools", "host": ["{{baseUrl}}"], "path": ["api", "tools"] }
+          }
+        },
+        {
+          "name": "5.2 Inspect Tool Details & Risk Level",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/tools/create_payroll_profile", "host": ["{{baseUrl}}"], "path": ["api", "tools", "create_payroll_profile"] }
+          }
+        },
+        {
+          "name": "5.3 Inspect Agent Tool Permissions Matrix",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/tools/agents/permissions", "host": ["{{baseUrl}}"], "path": ["api", "tools", "agents", "permissions"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. Human Approvals (HITL)",
+      "item": [
+        {
+          "name": "6.1 Get Pending Approvals",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/approvals/pending?workflow_id={{workflowId}}", "host": ["{{baseUrl}}"], "path": ["api", "approvals", "pending"], "query": [{ "key": "workflow_id", "value": "{{workflowId}}" }] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var list = pm.response.json();",
+                  "if (list && list.length > 0) {",
+                  "  pm.environment.set('approvalId', list[0].approval_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "6.2 Approve Pending Request",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reviewer\": \"Priya (Compliance Lead)\",\n  \"decision\": \"approved\",\n  \"comment\": \"Verified candidate consent form\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/approvals/{{approvalId}}/approve", "host": ["{{baseUrl}}"], "path": ["api", "approvals", "{{approvalId}}", "approve"] }
+          }
+        },
+        {
+          "name": "6.3 List Approval History",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/approvals/history?workflow_id={{workflowId}}", "host": ["{{baseUrl}}"], "path": ["api", "approvals", "history"], "query": [{ "key": "workflow_id", "value": "{{workflowId}}" }] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. Verifications & Email Operations",
+      "item": [
+        {
+          "name": "7.1 Submit Education Verification",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"workflow_id\": \"{{workflowId}}\",\n  \"candidate_name\": \"Rahul Sharma\",\n  \"institution\": \"ABC Engineering College\",\n  \"enrollment_number\": \"SYN-2020-1045\",\n  \"degree\": \"BTech\",\n  \"branch\": \"Computer Science Engineering\",\n  \"graduation_year\": 2024\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/verification/education", "host": ["{{baseUrl}}"], "path": ["api", "verification", "education"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  var data = pm.response.json();",
+                  "  pm.environment.set('verificationId', data.verification_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "7.2 Inject Simulated University Confirmation",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"workflow_id\": \"{{workflowId}}\",\n  \"sender\": \"registrar@abc-engineering.edu.test\",\n  \"subject\": \"RE: Education Verification\",\n  \"body\": \"We confirm that Rahul Sharma completed BTech in Computer Science Engineering in 2024.\",\n  \"outcome\": \"confirmed\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/email/mock-replies", "host": ["{{baseUrl}}"], "path": ["api", "email", "mock-replies"] }
+          }
+        },
+        {
+          "name": "7.3 Inspect Email Inbox",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/email/inbox?workflow_id={{workflowId}}", "host": ["{{baseUrl}}"], "path": ["api", "email", "inbox"], "query": [{ "key": "workflow_id", "value": "{{workflowId}}" }] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "8. Salary & Deterministic Finance",
+      "item": [
+        {
+          "name": "8.1 Calculate Deterministic Salary",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"annual_ctc\": 1200000,\n  \"designation\": \"Software Engineer\",\n  \"tax_regime\": \"new\",\n  \"allow_grade_override\": true\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/finance/salary/calculate", "host": ["{{baseUrl}}"], "path": ["api", "finance", "salary", "calculate"] }
+          }
+        },
+        {
+          "name": "8.2 Validate Salary Reconciliation",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"approved_ctc\": 1200000,\n  \"structure\": {\n    \"annual_ctc\": 1200000,\n    \"basic\": 480000,\n    \"hra\": 240000,\n    \"special_allowance\": 360000,\n    \"employer_pf\": 57600,\n    \"other_benefits\": 62400\n  }\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/finance/salary/validate", "host": ["{{baseUrl}}"], "path": ["api", "finance", "salary", "validate"] }
+          }
+        },
+        {
+          "name": "8.3 Get Employee Payroll Profile",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/finance/payroll/rahul.sharma@enterprise.test", "host": ["{{baseUrl}}"], "path": ["api", "finance", "payroll", "rahul.sharma@enterprise.test"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "9. Red Flags & Governance",
+      "item": [
+        {
+          "name": "9.1 List Active Red Flags",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/red-flags", "host": ["{{baseUrl}}"], "path": ["api", "red-flags"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var list = pm.response.json();",
+                  "if (list && list.length > 0) {",
+                  "  pm.environment.set('flagId', list[0].flag_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ]
+        },
+        {
+          "name": "9.2 Resolve Red Flag",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"resolved_by\": \"HR Operations Director\",\n  \"resolution_comment\": \"Verified through authentic university registrar transcripts\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/api/red-flags/{{flagId}}/resolve", "host": ["{{baseUrl}}"], "path": ["api", "red-flags", "{{flagId}}", "resolve"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "10. Recovery & Resilience",
+      "item": [
+        {
+          "name": "10.1 List Failed Tasks",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/recovery/failed-tasks", "host": ["{{baseUrl}}"], "path": ["api", "recovery", "failed-tasks"] }
+          }
+        },
+        {
+          "name": "10.2 Inspect Recovery Records",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/recovery/history?workflow_id={{workflowId}}", "host": ["{{baseUrl}}"], "path": ["api", "recovery", "history"], "query": [{ "key": "workflow_id", "value": "{{workflowId}}" }] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "11. Audit & Observability",
+      "item": [
+        {
+          "name": "11.1 Get Tamper-Evident Workflow Audit Trail",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/workflows/{{workflowId}}/audit", "host": ["{{baseUrl}}"], "path": ["api", "workflows", "{{workflowId}}", "audit"] }
+          }
+        },
+        {
+          "name": "11.2 Get Workflow Execution Timeline",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/workflows/{{workflowId}}/timeline", "host": ["{{baseUrl}}"], "path": ["api", "workflows", "{{workflowId}}", "timeline"] }
+          }
+        }
+      ]
+    }
+  ]
+}
+

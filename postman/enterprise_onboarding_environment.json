@@ -1,0 +1,43 @@
+{
+  "id": "enterprise-onboarding-env",
+  "name": "Enterprise Autonomous Onboarding Environment",
+  "values": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "workflowId",
+      "value": "WF-DEMO-01",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "employeeId",
+      "value": "EMP-DEMO-01",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "approvalId",
+      "value": "APR-DEMO-01",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "verificationId",
+      "value": "VER-DEMO-01",
+      "type": "default",
+      "enabled": true
+    },
+    {
+      "key": "flagId",
+      "value": "FLAG-DEMO-01",
+      "type": "default",
+      "enabled": true
+    }
+  ]
+}
+

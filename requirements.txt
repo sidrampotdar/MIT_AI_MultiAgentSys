@@ -1,3 +1,8 @@
 langchain
 langchain-groq
 pydantic
+google-genai
+python-dotenv
+pytest
+fastapi
+uvicorn
