@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Callable
 
+from app.core.contacts import employer_contact, institution_contact
 from app.core.salary import SalaryCalculationEngine
 from app.tools.communication import CommunicationSimulator
 from app.tools.compliance import ComplianceSimulator
@@ -42,6 +43,7 @@ class ToolRegistry:
         # verifier, tools that require approval refuse to run at all.
         self.state: Any = None
         self.approval_verifier: Callable[[str | None, str, dict[str, Any]], tuple[bool, str]] | None = None
+        self.final_review: Callable[[str], dict[str, Any]] = lambda workflow_id: {"checks": [], "passed": False}
 
     def register(self, tool: RegisteredTool) -> None:
         if tool.name in self._tools:
@@ -227,14 +229,28 @@ def build_enterprise_registry() -> ToolRegistry:
 
     # 2. Document Tools
     def _validate_docs(employee: dict[str, Any]) -> dict[str, Any]:
+        """Validate persisted uploads against the required set and supported formats.
+
+        Documents are never fabricated here. In demo mode (DEMO_SIMULATE_DOCUMENTS) the
+        service seeds clearly-labelled simulated documents before this tool runs.
+        """
         email = employee.get("email", "").lower()
-        DocumentSimulator.add_synthetic_documents(email)
-        res = DocumentSimulator.validate_documents(email)
-        missing = employee.get("missing_documents") or ([] if res.success else res.data.get("missing_documents", []))
+        docs = registry.state.list_documents(employee_email=email) if registry.state else []
+        usable = [d for d in docs if d["status"] != "rejected"]
+        present = {d["doc_type"] for d in usable}
+        required = DocumentSimulator.REQUIRED_DOCUMENTS
+        hinted_missing = list(employee.get("missing_documents") or [])
+        missing = [d for d in required if d not in present or d in hinted_missing]
         return {
             "status": "completed" if not missing else "blocked",
             "missing_documents": missing,
-            "verified": len(missing) == 0,
+            "verified": False,  # presence/format only: authenticity is never asserted
+            "documents": [
+                {"document_id": d["document_id"], "doc_type": d["doc_type"], "source": d["source"],
+                 "filename": d["filename"], "authenticity": d["authenticity"]}
+                for d in usable
+            ],
+            "rejected": [d["document_id"] for d in docs if d["status"] == "rejected"],
         }
 
     registry.register(RegisteredTool(
@@ -244,6 +260,7 @@ def build_enterprise_registry() -> ToolRegistry:
         allowed_agents=frozenset({"document_agent"}),
         handler=lambda employee: _validate_docs(employee),
         risk_level="low",
+        idempotent=False,
     ))
 
     registry.register(RegisteredTool(
@@ -255,30 +272,70 @@ def build_enterprise_registry() -> ToolRegistry:
         risk_level="low",
     ))
 
+    def _extract_fields(employee: dict[str, Any]) -> dict[str, Any]:
+        """Extract claimed fields from stored documents and compare with the candidate record.
+
+        Output is AI/parser-extracted data and is always labelled ``authenticity: unverified``.
+        Text uploads are parsed as ``key: value`` lines; other formats fall back to a
+        simulated extraction derived from the declared profile (explicitly labelled).
+        """
+        email = employee.get("email", "").lower()
+        docs = registry.state.list_documents(employee_email=email) if registry.state else []
+        declared = {
+            "candidate": f"{employee.get('first_name', '')} {employee.get('last_name', '')}".strip() or employee.get("name", ""),
+            "university": employee.get("university"),
+            "degree": employee.get("degree"),
+            "graduation_year": employee.get("graduation_year"),
+            "enrollment_number": employee.get("enrollment_number"),
+        }
+        extracted: dict[str, Any] = {}
+        inconsistencies: list[dict[str, Any]] = []
+        for doc in docs:
+            if doc["doc_type"] != "education_certificate":
+                continue
+            fields = (doc.get("extraction") or {}).get("fields")
+            method = (doc.get("extraction") or {}).get("method", "simulated_extraction")
+            if fields is None:
+                fields, method = dict(declared), "simulated_extraction"
+            registry.state.update_document(
+                doc["document_id"],
+                extraction={"fields": fields, "method": method, "authenticity": "unverified"},
+            )
+            extracted[doc["document_id"]] = {"fields": fields, "method": method}
+            for key, claimed in declared.items():
+                found = fields.get(key)
+                if claimed not in (None, "") and found not in (None, "") and str(found).strip().lower() != str(claimed).strip().lower():
+                    inconsistencies.append({"field": key, "declared": claimed, "document": found, "document_id": doc["document_id"]})
+        return {
+            "status": "completed" if extracted else "no_documents_to_extract",
+            "extraction": extracted,
+            "declared": declared,
+            "inconsistencies": inconsistencies,
+            "authenticity": "unverified",
+        }
+
     registry.register(RegisteredTool(
         name="extract_document_fields",
-        description="Extract structured educational and personal fields from document images or PDFs.",
+        description="Extract structured educational and personal fields from stored documents; results are unverified.",
         schema=employee_param,
         allowed_agents=frozenset({"document_agent"}),
-        handler=lambda employee: {
-            "candidate": f"{employee.get('first_name', '')} {employee.get('last_name', '')}".strip() or employee.get("name", ""),
-            "university": employee.get("university", "ABC Engineering College"),
-            "degree": employee.get("degree", "BTech"),
-            "graduation_year": employee.get("graduation_year", 2024),
-            "enrollment_number": employee.get("enrollment_number", "SYN-2020-1045"),
-        },
+        handler=lambda employee: _extract_fields(employee),
         risk_level="low",
+        idempotent=False,
     ))
 
     # 3. Verification Tools (Education & Employment)
     def _send_edu_verification(employee: dict[str, Any]) -> dict[str, Any]:
-        univ = employee.get("university", "ABC Engineering College")
-        recipient = "registrar@abc-engineering.edu.test"
+        contact = institution_contact(employee.get("university"))
+        if not contact:
+            return {"success": False, "error_code": "NO_APPROVED_CONTACT",
+                    "message": f"No approved verification contact for institution '{employee.get('university')}'"}
         return {
             "status": "sent",
-            "institution": univ,
-            "recipient": recipient,
-            "enrollment_number": employee.get("enrollment_number", "SYN-2020-1045"),
+            "institution": contact["name"],
+            "recipient": contact["contact"],
+            "enrollment_number": employee.get("enrollment_number"),
+            "simulated": True,
         }
 
     registry.register(RegisteredTool(
@@ -302,12 +359,16 @@ def build_enterprise_registry() -> ToolRegistry:
     ))
 
     def _send_emp_verification(employee: dict[str, Any]) -> dict[str, Any]:
-        employer = employee.get("previous_employer", "Tech Innovators Inc")
+        contact = employer_contact(employee.get("previous_employer"))
+        if not contact:
+            return {"success": False, "error_code": "NO_APPROVED_CONTACT",
+                    "message": f"No approved verification contact for employer '{employee.get('previous_employer')}'"}
         return {
             "status": "sent",
-            "employer": employer,
-            "recipient": "hr@tech-innovators.test",
-            "designation": employee.get("previous_designation", "Junior Engineer"),
+            "employer": contact["name"],
+            "recipient": contact["contact"],
+            "designation": employee.get("previous_designation"),
+            "simulated": True,
         }
 
     registry.register(RegisteredTool(
@@ -491,6 +552,8 @@ def build_enterprise_registry() -> ToolRegistry:
         email = employee.get("email", "").lower()
         name = f"{employee.get('first_name', '')} {employee.get('last_name', '')}".strip() or employee.get("name", "Employee")
         res = CommunicationSimulator.send_welcome_email(email, name)
+        if not res.success:
+            return {"success": False, "error_code": res.error_code, "message": res.message}
         return {"status": "sent", "recipient": email, "email_id": res.data.get("email_id")}
 
     registry.register(RegisteredTool(
@@ -532,6 +595,50 @@ def build_enterprise_registry() -> ToolRegistry:
             )
         },
         risk_level="low",
+    ))
+
+    # 9. Orientation & final review
+    def _schedule_orientation(employee: dict[str, Any]) -> dict[str, Any]:
+        from datetime import date, datetime, timedelta
+
+        raw = employee.get("joining_date")
+        try:
+            start = date.fromisoformat(raw) if raw else date.today() + timedelta(days=7)
+        except ValueError:
+            start = date.today() + timedelta(days=7)
+        email = employee.get("email", "").lower()
+        slug = sha256(email.encode()).hexdigest()[:8]
+        return {
+            "status": "scheduled",
+            "orientation_id": f"ORI-{slug.upper()}",
+            "date": start.isoformat(),
+            "start_time": "10:00",
+            "duration_minutes": 120,
+            "location": "Head Office, Training Room 1",
+            "meeting_link": f"https://meet.enterprise.test/orientation/{slug}",
+            "reporting_manager": employee.get("reporting_manager"),
+            "attendee": email,
+            "simulated_calendar": True,
+            "scheduled_at": datetime.now().isoformat(),
+        }
+
+    registry.register(RegisteredTool(
+        name="schedule_orientation",
+        description="Schedule the orientation session in the simulated corporate calendar.",
+        schema=employee_param,
+        allowed_agents=frozenset({"communication_agent", "hr_agent"}),
+        handler=lambda employee: _schedule_orientation(employee),
+        risk_level="low",
+    ))
+
+    registry.register(RegisteredTool(
+        name="final_onboarding_review",
+        description="Evaluate every mandatory completion condition before final HR approval.",
+        schema={"type": "object", "properties": {"workflow_id": {"type": "string"}}, "required": ["workflow_id"]},
+        allowed_agents=frozenset({"hr_agent", "planner_agent"}),
+        handler=lambda workflow_id: registry.final_review(workflow_id),
+        risk_level="medium",
+        idempotent=False,
     ))
 
     return registry

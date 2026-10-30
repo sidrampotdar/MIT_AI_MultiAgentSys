@@ -64,16 +64,11 @@ class OfflineProvider:
         calls: list[ToolRequest] = []
 
         if "produce a json execution plan" in prompt:
-            tasks = [
-                {"task_id": "documents", "agent": "document_agent", "tool": "validate_documents", "depends_on": []},
-                {"task_id": "education", "agent": "verification_agent", "tool": "send_education_verification", "depends_on": ["documents"], "approval_action": "send_education_verification"},
-                {"task_id": "salary", "agent": "finance_agent", "tool": "calculate_salary", "depends_on": ["education"], "approval_action": "finalize_salary_profile"},
-                {"task_id": "hr_record", "agent": "hr_agent", "tool": "create_hr_record", "depends_on": ["salary"]},
-                {"task_id": "accounts", "agent": "account_agent", "tool": "provision_standard_accounts", "depends_on": ["hr_record"]},
-                {"task_id": "equipment", "agent": "equipment_agent", "tool": "allocate_equipment", "depends_on": ["hr_record"]},
-                {"task_id": "compliance", "agent": "compliance_agent", "tool": "complete_compliance", "depends_on": ["hr_record"]},
-                {"task_id": "welcome", "agent": "communication_agent", "tool": "send_welcome_email", "depends_on": ["accounts", "equipment", "compliance"]},
-            ]
+            # Rule-based planner: select every task in the approved catalogue the prompt carries.
+            marker = "approved catalogue: "
+            raw = messages[-1].content
+            start = raw.lower().rfind(marker)
+            tasks = json.loads(raw[start + len(marker):]) if start != -1 else []
             return LLMResponse(
                 content=json.dumps({"tasks": tasks}),
                 provider="offline",

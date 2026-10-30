@@ -2,11 +2,12 @@ from app.core.llm import Message, OfflineProvider
 from app.core.service import OnboardingService, default_employee, load_system_prompt
 
 
-def _pending_approval(service: OnboardingService, workflow_id: str) -> str:
+def _pending_approval(service: OnboardingService, workflow_id: str, action: str | None = None) -> str:
     for event in service.audit(workflow_id):
         if event["event_type"] == "approval_requested":
             approval_id = event["output"]["approval_id"]
-            if service.state.approval(approval_id)["status"] == "pending":
+            approval = service.state.approval(approval_id)
+            if approval["status"] == "pending" and (action is None or approval["action"] == action):
                 return approval_id
     raise AssertionError("Expected a pending approval")
 
@@ -17,13 +18,15 @@ def test_workflow_persists_and_resumes_after_each_approval(tmp_path):
     workflow_id = service.start("Onboard Alice", default_employee())
     assert service.status(workflow_id)["status"] == "waiting_approval"
 
-    service.decide_approval(_pending_approval(service, workflow_id), "HR Manager", "approved")
+    service.decide_approval(_pending_approval(service, workflow_id, "send_education_verification"), "HR Manager", "approved")
     assert service.status(workflow_id)["status"] == "waiting_approval"
 
     # This new service instance proves a process can read the durable workflow.
     restarted_service = OnboardingService(database, provider="offline")
-    restarted_service.decide_approval(_pending_approval(restarted_service, workflow_id), "Finance Manager", "approved")
-    assert restarted_service.status(workflow_id)["status"] == "completed"
+    restarted_service.process_education_reply(workflow_id, "confirmed")
+    restarted_service.decide_approval(_pending_approval(restarted_service, workflow_id, "finalize_salary_profile"), "Finance Manager", "approved")
+    tasks = {t["task_id"]: t["status"] for t in restarted_service.status(workflow_id)["tasks"]}
+    assert tasks["salary"] == "completed" and tasks["hr_record"] == "pending"  # waits for employment verification
 
 
 def test_registry_denies_unknown_and_unauthorized_tools(tmp_path):
@@ -44,8 +47,11 @@ def test_equipment_shortage_recovers_using_approved_alternative(tmp_path):
     employee = default_employee()
     employee["laptop_available"] = False
     workflow_id = service.start("Onboard Alice", employee)
-    service.decide_approval(_pending_approval(service, workflow_id), "Compliance", "approved")
-    service.decide_approval(_pending_approval(service, workflow_id), "Finance", "approved")
+    service.decide_approval(_pending_approval(service, workflow_id, "send_education_verification"), "Compliance", "approved")
+    service.decide_approval(_pending_approval(service, workflow_id, "send_employment_verification"), "Compliance", "approved")
+    service.process_education_reply(workflow_id, "confirmed")
+    service.process_employment_reply(workflow_id, "confirmed")
+    service.decide_approval(_pending_approval(service, workflow_id, "finalize_salary_profile"), "Finance", "approved")
 
     equipment = next(task for task in service.status(workflow_id)["tasks"] if task["task_id"] == "equipment")
     event_types = [event["event_type"] for event in service.audit(workflow_id)]

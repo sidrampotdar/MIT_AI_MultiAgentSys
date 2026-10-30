@@ -16,11 +16,37 @@ from app.models.enums import RedFlagCategory, RedFlagSeverity
 from app.tools.store import store as shared_store
 
 
-def _get_pending_approval_id(service: OnboardingService, workflow_id: str) -> str:
+def _get_pending_approval_id(service: OnboardingService, workflow_id: str, action: str | None = None) -> str:
     approvals = service.state.list_approvals(workflow_id=workflow_id, status="pending")
+    if action:
+        approvals = [a for a in approvals if a["action"] == action]
     if not approvals:
-        raise AssertionError(f"Expected a pending approval for workflow {workflow_id}")
+        raise AssertionError(f"Expected a pending {action or ''} approval for workflow {workflow_id}")
     return approvals[0]["approval_id"]
+
+
+def _approve(service, workflow_id, action, reviewer="Reviewer", comment=""):
+    return service.decide_approval(_get_pending_approval_id(service, workflow_id, action), reviewer, "approved", comment)
+
+
+def drive_to_completion(service, workflow_id):
+    """Approve every gate and answer every verification request as a confirming counterparty."""
+    for _ in range(20):
+        status = service.status(workflow_id)["status"]
+        if status in {"completed", "blocked", "failed", "cancelled"}:
+            break
+        pending = service.state.list_approvals(workflow_id=workflow_id, status="pending")
+        if pending:
+            service.decide_approval(pending[-1]["approval_id"], "Reviewer", "approved")
+            continue
+        waiting = {t["task_id"] for t in service.status(workflow_id)["tasks"] if t["status"] == "waiting_reply"}
+        if "education" in waiting:
+            service.process_education_reply(workflow_id, "confirmed")
+        elif "employment" in waiting:
+            service.process_employment_reply(workflow_id, "confirmed")
+        else:
+            break
+    return service.status(workflow_id)
 
 
 # ============================================================================
@@ -39,19 +65,19 @@ def test_scenario_a_happy_path(tmp_path):
     assert wf["status"] == "waiting_approval"
 
     # 2. Education verification email approval
-    edu_approval = _get_pending_approval_id(service, workflow_id)
-    service.decide_approval(edu_approval, "Priya (HR Compliance)", "approved", "Candidate consent verified")
+    _approve(service, workflow_id, "send_education_verification", "Priya (HR Compliance)", "Candidate consent verified")
 
     # 3. Process university confirmation
     reply_res = service.process_education_reply(workflow_id, outcome="confirmed")
     assert reply_res["status"] == "confirmed"
 
-    # 4. Salary calculation & Finance approval
-    salary_approval = _get_pending_approval_id(service, workflow_id)
-    service.decide_approval(salary_approval, "Arun (Finance Director)", "approved", "CTC aligned with band")
+    # 4. Previous employer verification, salary, payroll, welcome and final HR approval
+    _approve(service, workflow_id, "send_employment_verification")
+    assert service.process_employment_reply(workflow_id, "confirmed")["status"] == "confirmed"
+    _approve(service, workflow_id, "finalize_salary_profile", "Arun (Finance Director)", "CTC aligned with band")
+    final_wf = drive_to_completion(service, workflow_id)
 
     # 5. Final state check: All tasks completed, HRIS record created, Accounts provisioned
-    final_wf = service.status(workflow_id)
     assert final_wf["status"] == "completed"
     tasks = {t["task_id"]: t["status"] for t in final_wf["tasks"]}
     assert tasks["documents"] == "completed"
@@ -62,6 +88,7 @@ def test_scenario_a_happy_path(tmp_path):
     assert tasks["equipment"] == "completed"
     assert tasks["compliance"] == "completed"
     assert tasks["welcome"] == "completed"
+    assert tasks["employment"] == tasks["payroll"] == tasks["orientation"] == tasks["final_review"] == "completed"
 
     # Tamper-evident audit trail check
     audit_events = service.audit(workflow_id)
@@ -81,7 +108,7 @@ def test_scenario_b_education_discrepancy(tmp_path):
     workflow_id = service.start("Onboard Rahul Sharma", emp)
 
     # Approve education request send
-    edu_approval = _get_pending_approval_id(service, workflow_id)
+    edu_approval = _get_pending_approval_id(service, workflow_id, "send_education_verification")
     service.decide_approval(edu_approval, "HR Compliance", "approved")
 
     # College reports mismatch (2023 instead of 2024)
@@ -122,12 +149,12 @@ def test_scenario_c_salary_mismatch(tmp_path):
     workflow_id = service.start("Onboard Vikram Roy", emp)
 
     # Approve education email
-    edu_approval = _get_pending_approval_id(service, workflow_id)
+    edu_approval = _get_pending_approval_id(service, workflow_id, "send_education_verification")
     service.decide_approval(edu_approval, "HR Compliance", "approved")
     service.process_education_reply(workflow_id, outcome="confirmed")
 
     # When salary approval is pending, Finance rejects due to CTC disagreement
-    salary_approval = _get_pending_approval_id(service, workflow_id)
+    salary_approval = _get_pending_approval_id(service, workflow_id, "finalize_salary_profile")
     service.decide_approval(
         salary_approval,
         reviewer="Finance Controller",
@@ -139,7 +166,7 @@ def test_scenario_c_salary_mismatch(tmp_path):
     assert wf["status"] == "blocked"
     tasks = {t["task_id"]: t["status"] for t in wf["tasks"]}
     assert tasks["salary"] == "blocked"
-    assert "Human approval rejected" in wf["tasks"][2]["error"]
+    assert "Human approval rejected" in next(t for t in wf["tasks"] if t["task_id"] == "salary")["error"]
 
 
 # ============================================================================
@@ -203,7 +230,7 @@ def test_scenario_f_prompt_injection_defense(tmp_path):
     service = OnboardingService(db_path, provider="offline")
 
     workflow_id = service.start("Onboard Alice", default_employee())
-    edu_approval = _get_pending_approval_id(service, workflow_id)
+    edu_approval = _get_pending_approval_id(service, workflow_id, "send_education_verification")
     service.decide_approval(edu_approval, "HR Compliance", "approved")
 
     # Inject malicious inbound email attempting prompt injection
@@ -240,14 +267,19 @@ def test_scenario_g_restart_and_resume(tmp_path):
     assert wf_reloaded["employee"]["name"] == "Alice Chen"
 
     # Process 2 resumes execution seamlessly
-    approval_id = _get_pending_approval_id(service_2, workflow_id)
-    service_2.decide_approval(approval_id, "HR Manager", "approved")
+    service_2.decide_approval(_get_pending_approval_id(service_2, workflow_id, "send_education_verification"), "HR Manager", "approved")
     service_2.process_education_reply(workflow_id, outcome="confirmed")
 
-    salary_approval_id = _get_pending_approval_id(service_2, workflow_id)
-    service_2.decide_approval(salary_approval_id, "Finance Director", "approved")
+    # Process 3 restarts again mid-flight; pending approvals and waiting tasks survive.
+    service_3 = OnboardingService(db_path, provider="offline")
+    service_3.decide_approval(_get_pending_approval_id(service_3, workflow_id, "send_employment_verification"), "HR Manager", "approved")
+    service_3.process_employment_reply(workflow_id, outcome="confirmed")
+    service_3.decide_approval(_get_pending_approval_id(service_3, workflow_id, "finalize_salary_profile"), "Finance Director", "approved")
 
     # Verification: Final workflow completed cleanly without duplicate side effects
-    final_wf = service_2.status(workflow_id)
+    final_wf = drive_to_completion(service_3, workflow_id)
     assert final_wf["status"] == "completed"
+    executions = service_3.state.list_tool_executions(workflow_id)
+    keys = [e["idempotency_key"] for e in executions if e["success"]]
+    assert len(keys) == len(set(keys)), "no tool ran twice for the same idempotency key"
 
