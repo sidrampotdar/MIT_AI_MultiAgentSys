@@ -131,20 +131,16 @@ export const IntakePage: React.FC = () => {
         {
           name: form.fullName,
           email: form.personalEmail,
-          personal_email: form.personalEmail,
           phone: form.phone,
           department: form.department,
           designation: form.designation,
           reporting_manager: form.reportingManager,
           joining_date: form.joiningDate,
-          employment_type: form.employmentType,
-          university_name: form.universityName,
-          degree: form.degree,
-          graduation_year: form.graduationYear,
-          proposed_ctc: form.proposedCtc,
-          previous_employer: form.previousEmployer,
-          onboarding_objective: form.onboardingObjective,
-          documents_attached: documentsAttached,
+          employment_type: form.employmentType.toLowerCase().replace('-', '_'),
+          annual_ctc: Number(form.proposedCtc),
+          university: form.universityName,
+          objective: form.onboardingObjective || 'Complete autonomous onboarding',
+          missing_documents: documentsAttached ? [] : ['degree_certificate'],
         }
       );
 
