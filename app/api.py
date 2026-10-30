@@ -267,6 +267,34 @@ def _workflow_or_404(service: OnboardingService, workflow_id: str, _user: Curren
 # 0. Authentication and User Management
 # ============================================================================
 
+class PersonaLoginPayload(AppBaseModel):
+    persona: str = Field(description="admin, hr, finance, it, security, compliance, or viewer")
+
+
+@app.post("/api/auth/persona", tags=["0. Auth"])
+def persona_quick_login_api(payload: PersonaLoginPayload) -> dict[str, Any]:
+    role = payload.persona.lower().strip()
+    if role not in ALL_ROLES:
+        raise HTTPException(status_code=422, detail=f"Unknown persona '{payload.persona}'. Expected one of: {sorted(ALL_ROLES)}")
+    service = get_service()
+    username = role if role != "admin" else "admin"
+    try:
+        user = service.state.user(username)
+    except KeyError:
+        bootstrap_admin(service.state)
+        try:
+            user = service.state.user(username)
+        except KeyError:
+            user = service.state.create_user(username, hash_password("Password123!"), role, f"Demo {role.title()}")
+    token, expires = create_access_token(user["username"], user["role"])
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": expires.isoformat(),
+        "user": {"username": user["username"], "role": user["role"], "full_name": user["full_name"]},
+    }
+
+
 @app.post("/api/auth/login", tags=["0. Auth"])
 def login_api(payload: LoginPayload) -> dict[str, Any]:
     service = get_service()

@@ -233,9 +233,25 @@ def allowed_origins() -> list[str]:
 
 
 def bootstrap_admin(state) -> None:
-    """Create the first admin from ADMIN_USERNAME / ADMIN_PASSWORD if no users exist."""
-    username, password = os.getenv("ADMIN_USERNAME"), os.getenv("ADMIN_PASSWORD")
-    if not username or not password or state.list_users():
+    """Create initial users if no users exist."""
+    existing_users = {u["username"] for u in state.list_users()}
+    if existing_users:
         return
-    state.create_user(username, hash_password(password), Role.ADMIN.value, "System Administrator")
-    logger.info("Bootstrapped initial admin user '%s'", username)
+
+    admin_user = os.getenv("ADMIN_USERNAME", "admin")
+    admin_pass = os.getenv("ADMIN_PASSWORD", "Password123!")
+
+    demo_personas = [
+        (admin_user, admin_pass, Role.ADMIN.value, "System Administrator"),
+        ("hr", "Password123!", Role.HR.value, "Priya Sharma (HR)"),
+        ("finance", "Password123!", Role.FINANCE.value, "Arun Patel (Finance)"),
+        ("it", "Password123!", Role.IT.value, "Alex Wong (IT Ops)"),
+        ("security", "Password123!", Role.SECURITY.value, "Elena Rostova (SecOps)"),
+        ("compliance", "Password123!", Role.COMPLIANCE.value, "Marcus Vance (Compliance)"),
+        ("viewer", "Password123!", Role.VIEWER.value, "Guest Viewer"),
+    ]
+
+    for username, pwd, role, full_name in demo_personas:
+        if username not in existing_users:
+            state.create_user(username, hash_password(pwd), role, full_name)
+            logger.info("Bootstrapped demo persona user '%s' (%s)", username, role)
